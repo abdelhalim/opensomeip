@@ -41,6 +41,11 @@ namespace someip::transport {
 
 inline constexpr size_t MAX_TCP_CONNECTIONS = SOMEIP_MAX_TCP_CONNECTIONS;
 
+// A zero-capacity table cannot serve anyone. Static builds already fail to
+// compile it; rejecting it here makes dynamic builds fail the same way instead
+// of starting a server that refuses every connection.
+static_assert(MAX_TCP_CONNECTIONS > 0, "SOMEIP_MAX_TCP_CONNECTIONS must be at least 1");
+
 /**
  * @brief TCP Connection State
  */
