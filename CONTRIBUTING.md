@@ -148,8 +148,9 @@ docker-compose -f docker-compose.dev.yml run --rm fedora-dev \
 
 Note that `pre-commit install` wires the hooks into `.git/hooks`, and those fire
 wherever you run `git commit`. If you build in a container but commit on the
-host, install pre-commit on the host as well, or the commit-msg hook will not
-run and CI will reject the commit message.
+host, run both install commands above on the host too. Otherwise the
+`commit-msg` hook never runs locally, and a message that does not follow
+Conventional Commits goes unnoticed until CI checks it.
 
 **What the hooks check:**
 - Trailing whitespace and end-of-file issues
