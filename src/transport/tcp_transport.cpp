@@ -153,6 +153,13 @@ Result TcpTransport::send_message(const Message& message, const Endpoint& endpoi
     }
     release_io(*slot);
 
+    if (result == Result::CONNECTION_LOST) {
+        // Part of the message reached the peer before the send budget ran out,
+        // so its stream no longer starts on a message boundary and nothing the
+        // peer receives afterwards can be framed. Closing is the only recovery.
+        close_peer_and_notify(endpoint);
+    }
+
     return result;
 }
 
@@ -208,7 +215,8 @@ size_t TcpTransport::connection_count() const {
     return active_count_locked();
 }
 
-/** @implements REQ_TRANSPORT_003_E01 */
+// Must stay lock-free: allocate_slot_locked() calls this with table_mutex_ held
+// and platform::Mutex is not recursive.
 size_t TcpTransport::max_connections() const {
     const size_t configured = (config_.max_connections == 0U) ? 1U : config_.max_connections;
     return std::min(configured, MAX_TCP_CONNECTIONS);
@@ -225,21 +233,9 @@ bool TcpTransport::is_peer_connected(const Endpoint& peer) const {
     return false;
 }
 
+/** @implements REQ_TRANSPORT_003b, REQ_TRANSPORT_018 */
 Result TcpTransport::disconnect_peer(const Endpoint& peer) {
-    EndpointList lost;
-    ConnectionSlot* slot = nullptr;
-    {
-        platform::ScopedLock const lock(table_mutex_);
-        slot = find_active_peer_locked(peer);
-        if (slot == nullptr) {
-            return Result::NOT_CONNECTED;
-        }
-        lost.push_back(slot->conn.remote_endpoint);
-    }
-
-    close_slot(*slot);
-    notify_peers_lost(lost);
-    return Result::SUCCESS;
+    return close_peer_and_notify(peer) ? Result::SUCCESS : Result::NOT_CONNECTED;
 }
 
 TcpTransport::ConnectionSlot* TcpTransport::find_active_peer_locked(const Endpoint& peer) {
@@ -289,12 +285,14 @@ size_t TcpTransport::active_count_locked() const {
 TcpTransport::ConnectionSlot* TcpTransport::acquire_io(const Endpoint& peer,
                                                        someip_socket_t& fd_out) {
     ConnectionSlot* slot = nullptr;
+    uint32_t generation = 0;
     {
         platform::ScopedLock const lock(table_mutex_);
         slot = find_active_peer_locked(peer);
         if (slot == nullptr) {
             return nullptr;
         }
+        generation = slot->generation;
     }
 
     // Waited on with table_mutex_ released, so a slow peer blocks only other
@@ -302,9 +300,13 @@ TcpTransport::ConnectionSlot* TcpTransport::acquire_io(const Endpoint& peer,
     slot->io_mutex.lock();
 
     platform::ScopedLock const lock(table_mutex_);
-    if (slot->state != SlotState::ACTIVE || !slot->conn.is_connected() ||
-        !same_peer(slot->conn.remote_endpoint, peer)) {
-        slot->io_mutex.unlock();  // Closed and possibly recycled while we waited.
+    // The generation settles this on its own. Re-checking the endpoint would
+    // not: the same peer may have dropped and reconnected into this slot while
+    // we waited, which is a different socket and a different stream position.
+    // ACTIVE implies the connection is established, since the only transition
+    // out of that also moves the slot to CLOSING.
+    if (slot->generation != generation || slot->state != SlotState::ACTIVE) {
+        slot->io_mutex.unlock();
         return nullptr;
     }
     fd_out = slot->conn.socket_fd;
@@ -313,18 +315,22 @@ TcpTransport::ConnectionSlot* TcpTransport::acquire_io(const Endpoint& peer,
 
 TcpTransport::ConnectionSlot* TcpTransport::acquire_io(someip_socket_t socket_fd) {
     ConnectionSlot* slot = nullptr;
+    uint32_t generation = 0;
     {
         platform::ScopedLock const lock(table_mutex_);
         slot = find_active_socket_locked(socket_fd);
         if (slot == nullptr) {
             return nullptr;
         }
+        generation = slot->generation;
     }
 
     slot->io_mutex.lock();
 
     platform::ScopedLock const lock(table_mutex_);
-    if (slot->state != SlotState::ACTIVE || slot->conn.socket_fd != socket_fd) {
+    // Comparing the descriptor instead would not be enough either: the OS is
+    // free to reissue the same number to the next peer accepted into this slot.
+    if (slot->generation != generation || slot->state != SlotState::ACTIVE) {
         slot->io_mutex.unlock();
         return nullptr;
     }
@@ -335,22 +341,22 @@ void TcpTransport::release_io(ConnectionSlot& slot) {
     slot.io_mutex.unlock();
 }
 
-void TcpTransport::close_slot(ConnectionSlot& slot) {
+void TcpTransport::claim_close_locked(ConnectionSlot& slot) {
+    slot.state = SlotState::CLOSING;
+    slot.conn.state = TcpConnectionState::DISCONNECTING;
+}
+
+void TcpTransport::finish_close(ConnectionSlot& slot) {
     someip_socket_t fd = SOMEIP_INVALID_SOCKET;
     {
         platform::ScopedLock const lock(table_mutex_);
-        if (slot.state != SlotState::ACTIVE) {
-            return;  // Another thread is already tearing this slot down.
-        }
-        // CLOSING keeps the slot off-limits to new I/O and stops it being
-        // handed to a new peer before the descriptor is actually released.
-        slot.state = SlotState::CLOSING;
-        slot.conn.state = TcpConnectionState::DISCONNECTING;
         fd = slot.conn.socket_fd;
     }
 
     // Waits out any I/O already in flight on this peer, without holding the
-    // table. The descriptor stays valid for that thread until it finishes.
+    // table. The descriptor stays valid for that thread until it finishes, and
+    // send_data() is bounded by send_timeout, so a peer that has stopped reading
+    // delays this by that budget rather than blocking it for good.
     slot.io_mutex.lock();
     if (fd != SOMEIP_INVALID_SOCKET) {
         someip_shutdown_socket(fd);
@@ -361,34 +367,59 @@ void TcpTransport::close_slot(ConnectionSlot& slot) {
         slot.conn.socket_fd = SOMEIP_INVALID_SOCKET;
         slot.conn.state = TcpConnectionState::DISCONNECTED;
         slot.conn.receive_buffer.clear();
+        // Retires every handle taken on the session that just ended, before the
+        // slot can be handed to a new peer.
+        ++slot.generation;
         slot.state = SlotState::FREE;
     }
     slot.io_mutex.unlock();
 }
 
-void TcpTransport::close_socket_and_notify(someip_socket_t socket_fd) {
-    EndpointList lost;
+bool TcpTransport::close_peer_and_notify(const Endpoint& peer) {
     ConnectionSlot* slot = nullptr;
+    Endpoint claimed;
+    {
+        platform::ScopedLock const lock(table_mutex_);
+        slot = find_active_peer_locked(peer);
+        if (slot == nullptr) {
+            return false;
+        }
+        claimed = slot->conn.remote_endpoint;
+        claim_close_locked(*slot);
+    }
+
+    finish_close(*slot);
+    notify_peer_lost(claimed);
+    return true;
+}
+
+void TcpTransport::close_socket_and_notify(someip_socket_t socket_fd) {
+    ConnectionSlot* slot = nullptr;
+    Endpoint claimed;
     {
         platform::ScopedLock const lock(table_mutex_);
         slot = find_active_socket_locked(socket_fd);
         if (slot == nullptr) {
             return;
         }
-        lost.push_back(slot->conn.remote_endpoint);
+        claimed = slot->conn.remote_endpoint;
+        claim_close_locked(*slot);
     }
 
-    close_slot(*slot);
-    notify_peers_lost(lost);
+    finish_close(*slot);
+    notify_peer_lost(claimed);
+}
+
+void TcpTransport::notify_peer_lost(const Endpoint& peer) {
+    auto* l = listener_.load(std::memory_order_acquire);
+    if (l != nullptr) {
+        l->on_connection_lost(peer);
+    }
 }
 
 void TcpTransport::notify_peers_lost(const EndpointList& peers) {
-    auto* l = listener_.load(std::memory_order_acquire);
-    if (l == nullptr) {
-        return;
-    }
     for (const auto& peer : peers) {
-        l->on_connection_lost(peer);
+        notify_peer_lost(peer);
     }
 }
 
@@ -460,14 +491,17 @@ bool TcpTransport::is_running() const {
     return running_;
 }
 
+/** @implements REQ_TRANSPORT_003a */
 TcpConnectionState TcpTransport::get_connection_state() const {
     platform::ScopedLock const lock(table_mutex_);
+    bool closing = false;
     for (const auto& slot : slots_) {
         if (slot.state == SlotState::ACTIVE && slot.conn.is_connected()) {
-            return TcpConnectionState::CONNECTED;
+            return TcpConnectionState::CONNECTED;  // One usable peer is enough.
         }
+        closing = closing || (slot.state == SlotState::CLOSING);
     }
-    return TcpConnectionState::DISCONNECTED;
+    return closing ? TcpConnectionState::DISCONNECTING : TcpConnectionState::DISCONNECTED;
 }
 
 Result TcpTransport::enable_server_mode(int backlog) {
@@ -689,20 +723,24 @@ Result TcpTransport::connect_internal(const Endpoint& endpoint) {
 }
 
 void TcpTransport::disconnect_internal() {
+    platform::Vector<ConnectionSlot*, MAX_TCP_CONNECTIONS> claimed;
     EndpointList lost;
     {
         platform::ScopedLock const lock(table_mutex_);
-        for (const auto& slot : slots_) {
-            if (slot.state == SlotState::ACTIVE) {
-                lost.push_back(slot.conn.remote_endpoint);
+        for (auto& slot : slots_) {
+            if (slot.state != SlotState::ACTIVE) {
+                continue;  // Free, or already claimed by another closer.
             }
+            lost.push_back(slot.conn.remote_endpoint);
+            claim_close_locked(slot);
+            claimed.push_back(&slot);
         }
     }
 
-    // close_slot() takes table_mutex_ itself and waits on each slot's io_mutex,
-    // so it must be called with the table released.
-    for (auto& slot : slots_) {
-        close_slot(slot);
+    // finish_close() takes table_mutex_ itself and waits on each slot's
+    // io_mutex, so it must be called with the table released.
+    for (ConnectionSlot* const slot : claimed) {
+        finish_close(*slot);
     }
 
     notify_peers_lost(lost);
@@ -811,9 +849,18 @@ void TcpTransport::service_peer(someip_socket_t socket_fd) {
         return;
     }
 
-    // Deliver every complete message with table_mutex_ released, so a
-    // listener may call back into the transport.
+    // Deliver every complete message holding neither the table nor any I/O
+    // rights, so a listener may call back into the transport. Rights are taken
+    // afresh per message rather than kept across the callback: acquire_io()
+    // re-validates the session, so a peer that disconnects or is recycled
+    // part-way through the drain simply ends the loop instead of letting this
+    // thread read a buffer that now belongs to someone else.
     while (running_) {
+        ConnectionSlot* const peer_slot = acquire_io(socket_fd);
+        if (peer_slot == nullptr) {
+            break;
+        }
+
         MessagePtr message;
         Endpoint sender_ep;
         TcpParseOutcome outcome = TcpParseOutcome::NEED_MORE;
@@ -823,17 +870,19 @@ void TcpTransport::service_peer(someip_socket_t socket_fd) {
         size_t prefix_len = 0;
         {
             platform::ScopedLock const lock(table_mutex_);
-            if (slot->state != SlotState::ACTIVE || slot->conn.socket_fd != socket_fd ||
-                slot->conn.receive_buffer.empty()) {
+            if (peer_slot->conn.receive_buffer.empty()) {
+                release_io(*peer_slot);
                 break;
             }
-            prefix_len = std::min(header_prefix.size(), slot->conn.receive_buffer.size());
-            std::copy_n(slot->conn.receive_buffer.data(), prefix_len, header_prefix.data());
-            outcome = parse_next_message(slot->conn.receive_buffer, message, rejection,
-                                         stage, slot->conn.framing_skip_remaining);
-            slot->conn.update_activity();
-            sender_ep = slot->conn.remote_endpoint;
+            prefix_len = std::min(header_prefix.size(), peer_slot->conn.receive_buffer.size());
+            std::copy_n(peer_slot->conn.receive_buffer.data(), prefix_len, header_prefix.data());
+            outcome = parse_next_message(peer_slot->conn.receive_buffer, message, rejection,
+                                         stage, peer_slot->conn.framing_skip_remaining);
+            peer_slot->conn.update_activity();
+            sender_ep = peer_slot->conn.remote_endpoint;
         }
+        release_io(*peer_slot);
+
         if (outcome == TcpParseOutcome::NEED_MORE) {
             break;
         }
@@ -944,14 +993,15 @@ void TcpTransport::connection_monitor_loop() {
                     now - slot.conn.last_activity);
                 if (idle > std::chrono::minutes(5)) {
                     timed_out.push_back(slot.conn.remote_endpoint);
+                    claim_close_locked(slot);
                     expired.push_back(&slot);
                 }
             }
         }
 
-        // close_slot() re-takes table_mutex_ and waits on each slot's io_mutex.
+        // finish_close() re-takes table_mutex_ and waits on each slot's io_mutex.
         for (ConnectionSlot* const slot : expired) {
-            close_slot(*slot);
+            finish_close(*slot);
         }
 
         notify_peers_lost(timed_out);
@@ -1004,6 +1054,12 @@ void TcpTransport::send_periodic_magic_cookie() {
             slot->conn.last_magic_cookie = now;
         }
         release_io(*slot);
+
+        if (result == Result::CONNECTION_LOST) {
+            // A half-written cookie leaves the peer unable to frame anything
+            // that follows, exactly as for a half-written message.
+            close_peer_and_notify(peer);
+        }
     }
 }
 
@@ -1012,6 +1068,12 @@ Result TcpTransport::send_data(someip_socket_t socket_fd, const platform::ByteBu
     size_t total_sent = 0;
     const uint8_t* buffer = data.data();
 
+    // SO_SNDTIMEO bounds one send(), but against a peer that never drains every
+    // one of them times out, so the retry needs a budget of its own. Without it
+    // this call keeps the connection's io_mutex for good and finish_close() on
+    // that peer, and therefore stop() and the destructor, never return.
+    const auto deadline = std::chrono::steady_clock::now() + config_.send_timeout;
+
     while (total_sent < data.size()) {
         ssize_t const sent = someip_send(socket_fd, buffer + total_sent,
                                          data.size() - total_sent, 0);
@@ -1019,14 +1081,22 @@ Result TcpTransport::send_data(someip_socket_t socket_fd, const platform::ByteBu
         if (sent < 0) {
             int const err = someip_socket_errno();
             if (err == SOMEIP_EAGAIN || err == SOMEIP_EWOULDBLOCK || err == SOMEIP_EINTR) {
-                continue;
+                if (std::chrono::steady_clock::now() < deadline) {
+                    continue;
+                }
+                // Nothing was written, so the peer's stream still starts on a
+                // message boundary and the caller may simply try again. Once any
+                // byte has gone out the stream is desynchronised and the caller
+                // has to close the connection instead.
+                return (total_sent == 0) ? Result::TIMEOUT : Result::CONNECTION_LOST;
             }
             return Result::NETWORK_ERROR;
-        } else if (sent == 0) {
+        }
+        if (sent == 0) {
             return Result::NETWORK_ERROR;  // Connection closed
         }
 
-        total_sent += sent;
+        total_sent += static_cast<size_t>(sent);
     }
 
     return Result::SUCCESS;
