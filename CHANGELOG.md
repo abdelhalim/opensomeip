@@ -189,6 +189,19 @@
 - **TCP**: `get_connection_state()` reports `DISCONNECTING` while a peer
   is being torn down; previously only `CONNECTED` and `DISCONNECTED` were
   ever returned.
+- **TCP**: a peer that reconnects from the same source port now replaces
+  its own stale connection. The accept path retires a still-ACTIVE entry
+  for that endpoint before allocating, so the table no longer holds two
+  entries for one peer — which made `find_active_peer_locked()` hand out
+  the dead descriptor — and no longer refuses the replacement outright
+  when the stale entry occupied the last free slot.
+- **TCP**: `connect()` restores blocking mode on the socket it hands to
+  the connection table. It was left non-blocking from the bounded
+  handshake, so `SO_SNDTIMEO` did not apply and `send_data()` spun on
+  `EAGAIN` for a full `send_timeout`, burning a core while holding that
+  connection's I/O lock.
+- **TCP**: `SOMEIP_MAX_TCP_CONNECTIONS` of 0 is now rejected at compile
+  time instead of building a server that refuses every connection.
 
 ### Interop Notes
 

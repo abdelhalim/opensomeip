@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <memory>
 #include <set>
 #include <vector>
@@ -1877,4 +1878,286 @@ TEST_F(TcpTransportTest, DisconnectingStalledPeerDoesNotHang) {
     healthy.transport->disconnect();
     healthy.transport->stop();
     server.stop();
+}
+
+namespace {
+
+/// Lets a test park the receive thread inside a delivery callback, so it can
+/// arrange events that would otherwise be serviced before it can observe them.
+class GatedTcpListener : public TestTcpListener {
+public:
+    void on_message_received(MessagePtr message, const Endpoint& sender) override {
+        if (gate_closed_.load()) {
+            parked_.store(true);
+            std::unique_lock<std::mutex> lock(gate_mutex_);
+            gate_cv_.wait_for(lock, std::chrono::seconds(10),
+                              [this]() { return !gate_closed_.load(); });
+            parked_.store(false);
+        }
+        TestTcpListener::on_message_received(std::move(message), sender);
+    }
+
+    void close_gate() { gate_closed_.store(true); }
+
+    void open_gate() {
+        {
+            std::scoped_lock const lock(gate_mutex_);
+            gate_closed_.store(false);
+        }
+        gate_cv_.notify_all();
+    }
+
+    bool parked() const { return parked_.load(); }
+
+private:
+    std::atomic<bool> gate_closed_{false};
+    std::atomic<bool> parked_{false};
+    std::mutex gate_mutex_;
+    std::condition_variable gate_cv_;
+};
+
+}  // namespace
+
+/**
+ * @test_case TC_TCP_STALE_PEER_RECONNECT
+ * @tests REQ_TRANSPORT_003b
+ * @brief A peer that reuses its source port replaces its own stale connection
+ *
+ * SOME/IP deployments routinely pin client ports, so a peer that is reset and
+ * reconnects arrives on the endpoint it already occupies. receive_loop() reads
+ * the listen socket before it reads the peers, so a replacement that is already
+ * waiting in the backlog is accepted while the dead descriptor is still ACTIVE.
+ *
+ * Getting there needs the receive thread held still. Left to itself the reset
+ * wakes select() on its own, a beat before the new handshake finishes, and the
+ * dead descriptor is reaped first — the race never runs. Parking the thread in a
+ * delivery callback lets both the reset and the new connection land, which is
+ * what a server busy serving other peers does anyway.
+ *
+ * The table is sized so that the stale connection occupies the last free slot,
+ * because that turns the flaw into something permanent and observable: with
+ * nowhere to put the replacement the server refuses the very client it is meant
+ * to be serving. With room to spare the same flaw is transient but no less
+ * wrong, leaving two ACTIVE slots for one endpoint so find_active_peer_locked()
+ * hands out the dead one.
+ */
+TEST_F(TcpTransportTest, ReconnectFromSameSourcePortReplacesStaleSlot) {
+    TcpTransportConfig paired = config;
+    paired.max_connections = 2;
+    paired.magic_cookie_enabled = false;
+
+    TcpTransport server(paired);
+    ASSERT_EQ(server.initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
+    ASSERT_EQ(server.enable_server_mode(), Result::SUCCESS);
+
+    GatedTcpListener server_listener;
+    server.set_listener(&server_listener);
+    ASSERT_EQ(server.start(), Result::SUCCESS);
+
+    const Endpoint server_ep = server.get_local_endpoint();
+
+    sockaddr_in server_addr = {};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_ep.get_port());
+    server_addr.sin_addr.s_addr = someip_inet_addr(server_ep.get_address().c_str());
+
+    // SO_REUSEADDR so the second socket can retake the port while the first
+    // four-tuple is still winding down.
+    auto connect_from_port = [&](uint16_t port) {
+        someip_socket_t const fd = someip_socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT_NE(fd, SOMEIP_INVALID_SOCKET);
+
+        int reuse = 1;
+        EXPECT_EQ(someip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)), 0);
+
+        sockaddr_in local = {};
+        local.sin_family = AF_INET;
+        local.sin_port = htons(port);
+        local.sin_addr.s_addr = someip_inet_addr("127.0.0.1");
+        EXPECT_EQ(someip_bind(fd, reinterpret_cast<const sockaddr*>(&local), sizeof(local)), 0);
+        EXPECT_EQ(someip_connect(fd, reinterpret_cast<const sockaddr*>(&server_addr),
+                                 sizeof(server_addr)),
+                  0);
+        return fd;
+    };
+
+    someip_socket_t const pinned_fd = connect_from_port(0);
+    ASSERT_NE(pinned_fd, SOMEIP_INVALID_SOCKET);
+
+    sockaddr_in local_addr = {};
+    socklen_t local_len = sizeof(local_addr);
+    ASSERT_EQ(someip_getsockname(pinned_fd, reinterpret_cast<sockaddr*>(&local_addr), &local_len),
+              0);
+    const uint16_t pinned_port = someip_ntohs(local_addr.sin_port);
+    const Endpoint pinned_ep("127.0.0.1", pinned_port, TransportProtocol::TCP);
+
+    // A second peer, whose traffic is what parks the receive thread.
+    ConnectedClient holder;
+    holder.transport = std::make_unique<TcpTransport>(paired);
+    holder.listener = std::make_unique<TestTcpListener>();
+    ASSERT_EQ(holder.transport->initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
+    holder.transport->set_listener(holder.listener.get());
+    ASSERT_EQ(holder.transport->start(), Result::SUCCESS);
+    ASSERT_EQ(holder.transport->connect(server_ep), Result::SUCCESS);
+
+    const auto up_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (server.connection_count() < 2U && std::chrono::steady_clock::now() < up_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(server.connection_count(), 2U);
+    ASSERT_TRUE(server.is_peer_connected(pinned_ep));
+
+    // Park the receive thread mid-delivery.
+    server_listener.close_gate();
+    ASSERT_EQ(holder.transport->send_message(make_tagged_message(0x01), server_ep),
+              Result::SUCCESS);
+
+    const auto park_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!server_listener.parked() && std::chrono::steady_clock::now() < park_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(server_listener.parked()) << "could not park the receive thread";
+
+    // Reset rather than close: a zero linger timeout sends RST, so the client
+    // keeps no TIME_WAIT and can retake the port at once. The reconnect completes
+    // into the listen backlog while the server is still parked.
+    struct linger const abort_linger = {1, 0};
+    ASSERT_EQ(someip_setsockopt(pinned_fd, SOL_SOCKET, SO_LINGER, &abort_linger,
+                                sizeof(abort_linger)),
+              0);
+    someip_close_socket(pinned_fd);
+
+    someip_socket_t const replacement_fd = connect_from_port(pinned_port);
+    ASSERT_NE(replacement_fd, SOMEIP_INVALID_SOCKET);
+
+    // Both the reset and the pending accept are now waiting on the same wakeup.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    server_listener.open_gate();
+
+    auto stale_losses = [&server_listener, pinned_port]() {
+        const auto losses = server_listener.get_lost_endpoints();
+        return std::count_if(losses.begin(), losses.end(), [pinned_port](const Endpoint& ep) {
+            return ep.get_port() == pinned_port;
+        });
+    };
+
+    // The stale connection ends up reported gone either way — retiring it on
+    // accept says so, and so does the reaping that follows a refused
+    // replacement. Waiting on that report, rather than on the table looking
+    // right, is what stops these assertions from reading the state that the
+    // stale connection is itself still propping up.
+    const auto lost_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (stale_losses() == 0 && std::chrono::steady_clock::now() < lost_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_GT(stale_losses(), 0) << "the stale connection must be reported lost";
+
+    // Give a refusal time to show up as one, so the table below is settled.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    EXPECT_TRUE(server.is_peer_connected(pinned_ep))
+        << "a client reusing its source port must end up connected, not refused";
+    EXPECT_EQ(server.connection_count(), 2U)
+        << "the replacement must occupy the slot its own stale connection left";
+
+    // Retiring the stale connection on accept must not double up with the
+    // reaping service_peer() would otherwise do.
+    EXPECT_EQ(stale_losses(), 1) << "the stale connection must be reported lost exactly once";
+
+    someip_close_socket(replacement_fd);
+    holder.transport->disconnect();
+    holder.transport->stop();
+    server.stop();
+}
+
+/**
+ * @test_case TC_TCP_CLIENT_SEND_NO_SPIN
+ * @tests REQ_TRANSPORT_002_E02
+ * @brief A client-mode send to a stalled peer waits rather than spins
+ *
+ * connect() bounds its handshake by making the socket non-blocking, and the
+ * descriptor it hands to the connection table has to be put back into blocking
+ * mode afterwards. If it is not, SO_SNDTIMEO no longer paces send_data(): every
+ * someip_send() returns EAGAIN at once and the retry burns a core until the send
+ * budget expires, all while holding that connection's I/O rights. The budget
+ * alone hides this, since the call still returns on time, so this measures CPU
+ * against wall time instead of only measuring the deadline.
+ */
+TEST_F(TcpTransportTest, ClientSendToStalledPeerWaitsWithoutSpinning) {
+    TcpTransportConfig slow = config;
+    slow.send_timeout = std::chrono::milliseconds(300);
+    slow.magic_cookie_enabled = false;
+
+    // A bare listening socket whose accepted peer never reads, with the receive
+    // buffer pinned small before the handshake so the kernel cannot grow it.
+    someip_socket_t const listen_fd = someip_socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_NE(listen_fd, SOMEIP_INVALID_SOCKET);
+
+    int reuse = 1;
+    ASSERT_EQ(someip_setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)), 0);
+
+    int rcvbuf = 2048;
+    ASSERT_EQ(someip_setsockopt(listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+    sockaddr_in listen_addr = {};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_port = 0;
+    listen_addr.sin_addr.s_addr = someip_inet_addr("127.0.0.1");
+    ASSERT_EQ(someip_bind(listen_fd, reinterpret_cast<const sockaddr*>(&listen_addr),
+                          sizeof(listen_addr)),
+              0);
+    ASSERT_EQ(someip_listen(listen_fd, 1), 0);
+
+    sockaddr_in bound = {};
+    socklen_t bound_len = sizeof(bound);
+    ASSERT_EQ(someip_getsockname(listen_fd, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
+    const Endpoint stalled_server_ep("127.0.0.1", someip_ntohs(bound.sin_port),
+                                     TransportProtocol::TCP);
+
+    TcpTransport client(slow);
+    ASSERT_EQ(client.initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
+
+    TestTcpListener client_listener;
+    client.set_listener(&client_listener);
+    ASSERT_EQ(client.start(), Result::SUCCESS);
+    ASSERT_EQ(client.connect(stalled_server_ep), Result::SUCCESS);
+
+    someip_socket_t const accepted_fd = someip_accept(listen_fd, nullptr, nullptr);
+    ASSERT_NE(accepted_fd, SOMEIP_INVALID_SOCKET);
+
+    // Fill the path until a send gives up, then compare what that cost. A
+    // blocking socket parks in the kernel, so the CPU charged to this process
+    // stays far below the time spent; a spin charges close to all of it.
+    std::vector<uint8_t> payload(1024, 0xEF);
+    Message big = make_tagged_message(0xEE);
+    big.set_payload(payload.data(), payload.size());
+
+    const auto wall_start = std::chrono::steady_clock::now();
+    const std::clock_t cpu_start = std::clock();
+
+    Result last = Result::SUCCESS;
+    const auto flood_deadline = wall_start + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < flood_deadline) {
+        last = client.send_message(big, stalled_server_ep);
+        if (last != Result::SUCCESS) {
+            break;
+        }
+    }
+
+    const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - wall_start)
+                             .count();
+    const auto cpu_ms =
+        static_cast<long long>((std::clock() - cpu_start) * 1000 / CLOCKS_PER_SEC);
+
+    EXPECT_NE(last, Result::SUCCESS) << "the stalled peer should have blocked a send";
+    ASSERT_GT(wall_ms, 0);
+    EXPECT_LT(cpu_ms * 2, wall_ms)
+        << "client-mode send spun instead of waiting: " << cpu_ms << "ms CPU over " << wall_ms
+        << "ms";
+
+    someip_close_socket(accepted_fd);
+    someip_close_socket(listen_fd);
+    client.disconnect();
+    client.stop();
 }

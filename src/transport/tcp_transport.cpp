@@ -671,6 +671,18 @@ Result TcpTransport::connect_internal(const Endpoint& endpoint) {
         return Result::NETWORK_ERROR;
     }
 
+    // create_socket() made this descriptor non-blocking so that the connect
+    // above could be bounded by connection_timeout. Now that it carries
+    // traffic, put it back into blocking mode to match an accepted socket:
+    // send_data() leans on SO_SNDTIMEO to pace each send(), and a non-blocking
+    // socket ignores that option and turns the retry into a busy-spin.
+    if (setup_socket_options(socket_fd, true) != Result::SUCCESS) {
+        platform::ScopedLock const lock(table_mutex_);
+        someip_close_socket(bound_socket_fd_);
+        bound_socket_fd_ = SOMEIP_INVALID_SOCKET;
+        return Result::NETWORK_ERROR;
+    }
+
     {
         platform::ScopedLock const lock(table_mutex_);
         ConnectionSlot* const slot = allocate_slot_locked();
@@ -740,6 +752,30 @@ void TcpTransport::accept_pending_peer() {
     someip_socket_t const client_fd = accept_connection_with_peer(peer_ep);
     if (client_fd == SOMEIP_INVALID_SOCKET) {
         return;
+    }
+
+    // A client that pins its source port can reconnect from the same endpoint
+    // before the old descriptor has been reaped, and receive_loop() services the
+    // listen socket ahead of the peers. Retire the stale slot first: two ACTIVE
+    // entries for one peer would make find_active_peer_locked() hand out the
+    // dead descriptor and inflate connection_count().
+    ConnectionSlot* stale = nullptr;
+    Endpoint stale_ep("0.0.0.0", 0, TransportProtocol::TCP);
+    {
+        platform::ScopedLock const lock(table_mutex_);
+        stale = find_active_peer_locked(peer_ep);
+        if (stale != nullptr) {
+            stale_ep = stale->conn.remote_endpoint;
+            claim_close_locked(*stale);
+        }
+    }
+
+    // Claiming only pins the slot. It has to reach FREE before
+    // allocate_slot_locked() can hand it back when the table is full, so the
+    // teardown completes here, with table_mutex_ released.
+    if (stale != nullptr) {
+        finish_close(*stale);
+        notify_peer_lost(stale_ep);
     }
 
     bool accepted = false;
@@ -1028,6 +1064,12 @@ Result TcpTransport::send_data(someip_socket_t socket_fd, const platform::ByteBu
             int const err = someip_socket_errno();
             if (err == SOMEIP_EAGAIN || err == SOMEIP_EWOULDBLOCK || err == SOMEIP_EINTR) {
                 if (std::chrono::steady_clock::now() < deadline) {
+                    // Paced by SO_SNDTIMEO rather than by this loop: every
+                    // served descriptor is blocking, so a send that cannot make
+                    // progress parks in the kernel for the timeout before it
+                    // reports EAGAIN. Retrying here would burn a core on a
+                    // non-blocking descriptor, which is why connect_internal()
+                    // restores blocking mode before handing one over.
                     continue;
                 }
                 // Nothing was written, so the peer's stream still starts on a
