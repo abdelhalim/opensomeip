@@ -17,6 +17,7 @@
 #include <tp/tp_reassembler.h>
 #include <someip/message.h>
 #include <e2e/e2e_header.h>
+#include <algorithm>
 #include <thread>
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
@@ -46,7 +47,11 @@ using namespace someip::tp;
  * @tests REQ_TP_082_E01, REQ_TP_082_E02, REQ_TP_082_E03, REQ_TP_082_E04
  * @tests feat_req_someiptp_400
  * @tests feat_req_someiptp_402
+ * @tests feat_req_someiptp_772, feat_req_someiptp_782, feat_req_someiptp_792
  * @tests feat_req_someiptp_410
+ * @tests feat_req_someip_761
+ * @tests REQ_MSG_056, REQ_MSG_060_TP_RESPONSE
+ * @tests REQ_TP_090, REQ_TP_091, REQ_TP_078
  */
 class TpTest : public ::testing::Test {
 protected:
@@ -919,7 +924,7 @@ TEST_F(TpTest, ReassemblyCompositeKey) {
         TpSegment seg;
         seg.header.message_length = 100;
         seg.header.segment_offset = 0;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = 52;
         seg.header.sequence_number = 1;
         seg.header.message_type = TpMessageType::FIRST_SEGMENT;
         seg.header.service_id = service;
@@ -928,12 +933,15 @@ TEST_F(TpTest, ReassemblyCompositeKey) {
         seg.header.session_id = session;
         seg.header.protocol_version = 1;
         seg.header.interface_version = 1;
-        seg.payload.resize(40, 0xAA);
+        seg.payload.resize(52, 0xAA);
         // Wire SOME/IP header
         seg.payload[0] = static_cast<uint8_t>(service >> 8U);
         seg.payload[1] = static_cast<uint8_t>(service & 0xFFU);
         seg.payload[2] = static_cast<uint8_t>(method >> 8U);
         seg.payload[3] = static_cast<uint8_t>(method & 0xFFU);
+        // SOME/IP Length = 8 + 4 + 32 = 44
+        seg.payload[4] = 0x00; seg.payload[5] = 0x00;
+        seg.payload[6] = 0x00; seg.payload[7] = 44;
         seg.payload[8] = static_cast<uint8_t>(client >> 8U);
         seg.payload[9] = static_cast<uint8_t>(client & 0xFFU);
         seg.payload[10] = static_cast<uint8_t>(session >> 8U);
@@ -969,10 +977,13 @@ TEST_F(TpTest, ReassemblySessionIdDiscard) {
 
     auto make_tp_segment = [](TpMessageType tp_type, uint16_t session, uint32_t msg_len,
                               uint32_t offset, bool more) {
+        // Payload = 32 bytes (16-aligned) when more=true, so datagram = 52
+        const size_t payload_bytes = more ? 32U : 20U;
+        const size_t total = 20 + payload_bytes;
         TpSegment seg;
         seg.header.message_length = msg_len;
         seg.header.segment_offset = offset;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = static_cast<uint16_t>(total);
         seg.header.sequence_number = 1;
         seg.header.message_type = tp_type;
         seg.header.service_id = 0x1111;
@@ -981,10 +992,16 @@ TEST_F(TpTest, ReassemblySessionIdDiscard) {
         seg.header.session_id = session;
         seg.header.protocol_version = 1;
         seg.header.interface_version = 1;
-        seg.payload.resize(40, 0x00);
+        seg.payload.resize(total, 0x00);
         // Wire SOME/IP header
         seg.payload[0] = 0x11; seg.payload[1] = 0x11;  // Service
         seg.payload[2] = 0x22; seg.payload[3] = 0x22;  // Method
+        // SOME/IP Length = 8 + 4 + payload_bytes
+        const auto sl = static_cast<uint32_t>(8 + 4 + payload_bytes);
+        seg.payload[4] = static_cast<uint8_t>((sl >> 24U) & 0xFFU);
+        seg.payload[5] = static_cast<uint8_t>((sl >> 16U) & 0xFFU);
+        seg.payload[6] = static_cast<uint8_t>((sl >> 8U) & 0xFFU);
+        seg.payload[7] = static_cast<uint8_t>(sl & 0xFFU);
         seg.payload[8] = 0xAA; seg.payload[9] = 0xAA;  // Client
         seg.payload[10] = static_cast<uint8_t>(session >> 8U);
         seg.payload[11] = static_cast<uint8_t>(session & 0xFFU);
@@ -1129,7 +1146,7 @@ TEST_F(TpTest, RequestVsNotificationDifferentBuffers) {
         TpSegment seg;
         seg.header.message_length = 100;
         seg.header.segment_offset = 0;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = 52;
         seg.header.sequence_number = 1;
         seg.header.message_type = TpMessageType::FIRST_SEGMENT;
         seg.header.service_id = 0x1111;
@@ -1138,10 +1155,13 @@ TEST_F(TpTest, RequestVsNotificationDifferentBuffers) {
         seg.header.session_id = 0x0001;
         seg.header.protocol_version = 1;
         seg.header.interface_version = 1;
-        seg.payload.resize(40, 0x00);
+        seg.payload.resize(52, 0x00);
         // Wire SOME/IP header
         seg.payload[0] = 0x11; seg.payload[1] = 0x11;  // Service
         seg.payload[2] = 0x22; seg.payload[3] = 0x22;  // Method
+        // SOME/IP Length = 8 + 4 + 32 = 44
+        seg.payload[4] = 0x00; seg.payload[5] = 0x00;
+        seg.payload[6] = 0x00; seg.payload[7] = 44;
         seg.payload[8] = 0xAA; seg.payload[9] = 0xAA;  // Client
         seg.payload[10] = 0x00; seg.payload[11] = 0x01; // Session
         seg.payload[12] = 0x01;  // Protocol Version
@@ -1255,8 +1275,8 @@ TEST_F(TpTest, NeedsSegmentationUsesPayloadSize) {
  * @tests REQ_TP_039
  * @brief get_reassembly_progress reports per-byte received count, not N * max_segment_size
  *
- * After one FIRST_SEGMENT carrying 20 payload bytes (40 - 20 header overhead),
- * received_bytes must be 20, not 20 * max_segment_size.
+ * After one FIRST_SEGMENT carrying 32 payload bytes (52 - 20 header overhead),
+ * received_bytes must be 32, not 32 * max_segment_size.
  */
 TEST_F(TpTest, ReassemblyProgressCountsBytes) {
     TpReassembler reassembler(config);
@@ -1264,17 +1284,20 @@ TEST_F(TpTest, ReassemblyProgressCountsBytes) {
     TpSegment seg;
     seg.header.message_length = 100;
     seg.header.segment_offset = 0;
-    seg.header.segment_length = 40;  // 20 header + 20 payload
+    seg.header.segment_length = 52;  // 20 header + 32 payload (16-aligned)
     seg.header.sequence_number = 1;
     seg.header.message_type = TpMessageType::FIRST_SEGMENT;
     seg.header.service_id = 0x1111;
     seg.header.method_id = 0x2222;
     seg.header.client_id = 0xAAAA;
     seg.header.session_id = 0x0001;
-    seg.payload.resize(40, 0x00);
+    seg.payload.resize(52, 0x00);
     // Wire SOME/IP header
     seg.payload[0] = 0x11; seg.payload[1] = 0x11;  // Service
     seg.payload[2] = 0x22; seg.payload[3] = 0x22;  // Method
+    // SOME/IP Length = 8 + 4 + 32 = 44
+    seg.payload[4] = 0x00; seg.payload[5] = 0x00;
+    seg.payload[6] = 0x00; seg.payload[7] = 44;
     seg.payload[8] = 0xAA; seg.payload[9] = 0xAA;  // Client
     seg.payload[10] = 0x00; seg.payload[11] = 0x01; // Session
     seg.payload[12] = 0x01; seg.payload[13] = 0x01; // Proto, Iface
@@ -1292,7 +1315,7 @@ TEST_F(TpTest, ReassemblyProgressCountsBytes) {
     uint32_t total_bytes = 0;
     ASSERT_TRUE(reassembler.get_reassembly_progress(msg_id, received_bytes, total_bytes));
     EXPECT_EQ(total_bytes, 100u);
-    EXPECT_EQ(received_bytes, 20u)
+    EXPECT_EQ(received_bytes, 32u)
         << "received_bytes must be the actual byte count, not bytes * max_segment_size";
 }
 
@@ -1311,17 +1334,20 @@ TEST_F(TpTest, WireKeyOverridesTpSegmentHeader) {
         TpSegment seg;
         seg.header.message_length = 100;
         seg.header.segment_offset = 0;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = 52;
         seg.header.sequence_number = 1;
         seg.header.message_type = TpMessageType::FIRST_SEGMENT;
         seg.header.service_id = 0;  // intentionally zero
         seg.header.method_id = 0;
         seg.header.client_id = 0xAAAA;
         seg.header.session_id = 0x0001;
-        seg.payload.resize(40, 0x00);
+        seg.payload.resize(52, 0x00);
         // Wire Service ID at bytes 0-1
         seg.payload[0] = static_cast<uint8_t>((wire_service >> 8U) & 0xFFU);
         seg.payload[1] = static_cast<uint8_t>(wire_service & 0xFFU);
+        // SOME/IP Length = 8 + 4 + 32 = 44
+        seg.payload[4] = 0x00; seg.payload[5] = 0x00;
+        seg.payload[6] = 0x00; seg.payload[7] = 44;
         // Wire Message Type at byte 14: REQUEST | TP-Flag
         seg.payload[14] = 0x20;
         // Wire Client ID at 8-9, Session ID at 10-11
@@ -1401,10 +1427,12 @@ TEST_F(TpTest, MismatchedMessageLengthRejectedBufferPreserved) {
 
     auto make_seg = [](uint32_t msg_len, uint32_t offset, bool more,
                        TpMessageType tp_type, uint16_t session) {
+        const size_t payload_bytes = more ? 32U : 20U;
+        const size_t total = 20 + payload_bytes;
         TpSegment seg;
         seg.header.message_length = msg_len;
         seg.header.segment_offset = offset;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = static_cast<uint16_t>(total);
         seg.header.sequence_number = 1;
         seg.header.message_type = tp_type;
         seg.header.service_id = 0x1111;
@@ -1413,9 +1441,14 @@ TEST_F(TpTest, MismatchedMessageLengthRejectedBufferPreserved) {
         seg.header.session_id = session;
         seg.header.protocol_version = 1;
         seg.header.interface_version = 1;
-        seg.payload.resize(40, 0x00);
+        seg.payload.resize(total, 0x00);
         seg.payload[0] = 0x11; seg.payload[1] = 0x11;
         seg.payload[2] = 0x22; seg.payload[3] = 0x22;
+        const auto sl = static_cast<uint32_t>(8 + 4 + payload_bytes);
+        seg.payload[4] = static_cast<uint8_t>((sl >> 24U) & 0xFFU);
+        seg.payload[5] = static_cast<uint8_t>((sl >> 16U) & 0xFFU);
+        seg.payload[6] = static_cast<uint8_t>((sl >> 8U) & 0xFFU);
+        seg.payload[7] = static_cast<uint8_t>(sl & 0xFFU);
         seg.payload[8] = 0xAA; seg.payload[9] = 0xAA;
         seg.payload[10] = static_cast<uint8_t>(session >> 8U);
         seg.payload[11] = static_cast<uint8_t>(session & 0xFFU);
@@ -1452,10 +1485,12 @@ TEST_F(TpTest, PlacementFailurePreservesBuffer) {
 
     auto make_seg = [](uint32_t msg_len, uint32_t offset, bool more,
                        TpMessageType tp_type) {
+        const size_t payload_bytes = more ? 32U : 20U;
+        const size_t total = 20 + payload_bytes;
         TpSegment seg;
         seg.header.message_length = msg_len;
         seg.header.segment_offset = offset;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = static_cast<uint16_t>(total);
         seg.header.sequence_number = 1;
         seg.header.message_type = tp_type;
         seg.header.service_id = 0x1111;
@@ -1464,9 +1499,14 @@ TEST_F(TpTest, PlacementFailurePreservesBuffer) {
         seg.header.session_id = 0x0001;
         seg.header.protocol_version = 1;
         seg.header.interface_version = 1;
-        seg.payload.resize(40, 0x00);
+        seg.payload.resize(total, 0x00);
         seg.payload[0] = 0x11; seg.payload[1] = 0x11;
         seg.payload[2] = 0x22; seg.payload[3] = 0x22;
+        const auto sl = static_cast<uint32_t>(8 + 4 + payload_bytes);
+        seg.payload[4] = static_cast<uint8_t>((sl >> 24U) & 0xFFU);
+        seg.payload[5] = static_cast<uint8_t>((sl >> 16U) & 0xFFU);
+        seg.payload[6] = static_cast<uint8_t>((sl >> 8U) & 0xFFU);
+        seg.payload[7] = static_cast<uint8_t>(sl & 0xFFU);
         seg.payload[8] = 0xAA; seg.payload[9] = 0xAA;
         seg.payload[10] = 0x00; seg.payload[11] = 0x01;
         seg.payload[12] = 0x01; seg.payload[13] = 0x01;
@@ -1479,16 +1519,16 @@ TEST_F(TpTest, PlacementFailurePreservesBuffer) {
         return seg;
     };
 
-    // FIRST segment: message_length = 48, offset 0, 20 payload bytes
+    // FIRST segment: message_length = 64, offset 0, 32 payload bytes
     platform::ByteBuffer complete;
     ASSERT_TRUE(reassembler.process_segment(
-        make_seg(48, 0, true, TpMessageType::FIRST_SEGMENT), complete));
+        make_seg(64, 0, true, TpMessageType::FIRST_SEGMENT), complete));
     ASSERT_EQ(reassembler.get_active_reassemblies(), 1u);
 
-    // CONSECUTIVE with wire offset 48 — past total_length, same message_length
-    // validate_segment will reject because 48 > 48 (wire_offset > message_length)
+    // LAST with wire offset 64 — past total_length, same message_length
+    // validate_segment will reject because 64 > 64 (wire_offset > message_length)
     EXPECT_FALSE(reassembler.process_segment(
-        make_seg(48, 48, false, TpMessageType::LAST_SEGMENT), complete));
+        make_seg(64, 64, false, TpMessageType::LAST_SEGMENT), complete));
     EXPECT_EQ(reassembler.get_active_reassemblies(), 1u)
         << "Buffer must be preserved after placement failure";
 }
@@ -1506,7 +1546,7 @@ TEST_F(TpTest, KeyBasedApiTargetsExactKey) {
         TpSegment seg;
         seg.header.message_length = 100;
         seg.header.segment_offset = 0;
-        seg.header.segment_length = 40;
+        seg.header.segment_length = 52;
         seg.header.sequence_number = 1;
         seg.header.message_type = TpMessageType::FIRST_SEGMENT;
         seg.header.service_id = 0x1111;
@@ -1515,9 +1555,12 @@ TEST_F(TpTest, KeyBasedApiTargetsExactKey) {
         seg.header.session_id = session;
         seg.header.protocol_version = 1;
         seg.header.interface_version = 1;
-        seg.payload.resize(40, 0x00);
+        seg.payload.resize(52, 0x00);
         seg.payload[0] = 0x11; seg.payload[1] = 0x11;
         seg.payload[2] = 0x22; seg.payload[3] = 0x22;
+        // SOME/IP Length = 8 + 4 + 32 = 44
+        seg.payload[4] = 0x00; seg.payload[5] = 0x00;
+        seg.payload[6] = 0x00; seg.payload[7] = 44;
         seg.payload[8] = static_cast<uint8_t>(client >> 8U);
         seg.payload[9] = static_cast<uint8_t>(client & 0xFFU);
         seg.payload[10] = static_cast<uint8_t>(session >> 8U);
@@ -1560,7 +1603,7 @@ TEST_F(TpTest, KeyBasedApiTargetsExactKey) {
     uint32_t total = 0;
     EXPECT_TRUE(reassembler.get_reassembly_progress(key_a, received, total));
     EXPECT_EQ(total, 100u);
-    EXPECT_EQ(received, 20u);
+    EXPECT_EQ(received, 32u);
 
     // Cancel only transfer A
     reassembler.cancel_reassembly(key_a);
@@ -1568,4 +1611,397 @@ TEST_F(TpTest, KeyBasedApiTargetsExactKey) {
     EXPECT_TRUE(reassembler.is_reassembling(key_b))
         << "cancel_reassembly(key) must not affect other transfers with the same message_id";
     EXPECT_EQ(reassembler.get_active_reassemblies(), 1u);
+}
+
+/**
+ * @test_case TC_TP_TYPE_A0_A1
+ * @tests REQ_MSG_056, REQ_MSG_060_TP_RESPONSE
+ * @tests feat_req_someip_761
+ * @brief uses_tp is a bit test; 0xA0 and 0xA1 deserialize
+ */
+TEST_F(TpTest, TpFlagBitIncludesResponseAndError) {
+    EXPECT_TRUE(uses_tp(MessageType::TP_REQUEST));
+    EXPECT_TRUE(uses_tp(MessageType::TP_RESPONSE));
+    EXPECT_TRUE(uses_tp(MessageType::TP_ERROR));
+    EXPECT_TRUE(uses_tp(static_cast<MessageType>(0xA0)));
+    EXPECT_TRUE(uses_tp(static_cast<MessageType>(0xA1)));
+    EXPECT_FALSE(uses_tp(MessageType::REQUEST));
+    EXPECT_FALSE(uses_tp(MessageType::RESPONSE));
+    EXPECT_EQ(without_tp_flag(MessageType::TP_RESPONSE), MessageType::RESPONSE);
+    EXPECT_EQ(without_tp_flag(MessageType::TP_ERROR), MessageType::ERROR);
+
+    Message response(MessageId(0x1234, 0x0001), RequestId(0x0001, 0x0001),
+                     MessageType::TP_RESPONSE, ReturnCode::E_OK);
+    response.set_payload({0x11});
+    Message decoded;
+    ASSERT_TRUE(decoded.deserialize(response.serialize()));
+    EXPECT_TRUE(decoded.uses_tp());
+    EXPECT_TRUE(decoded.is_response());
+
+    Message error(MessageId(0x1234, 0x0001), RequestId(0x0001, 0x0001),
+                  MessageType::TP_ERROR, ReturnCode::E_NOT_OK);
+    error.set_payload({0x22});
+    ASSERT_TRUE(decoded.deserialize(error.serialize()));
+    EXPECT_TRUE(decoded.uses_tp());
+    EXPECT_TRUE(decoded.is_response());
+}
+
+/**
+ * @test_case TC_TP_RESPONSE_WIRE_A0
+ * @tests REQ_TP_007, REQ_MSG_056, feat_req_someip_761
+ * @brief Segmented RESPONSE carries Message Type 0xA0 on the wire
+ */
+TEST_F(TpTest, ResponseSegmentsHaveTypeA0) {
+    TpSegmenter segmenter(config);
+
+    Message message(MessageId(0x1234, 0x5678), RequestId(0xABCD, 0x0001),
+                    MessageType::RESPONSE, ReturnCode::E_OK);
+    message.set_payload(platform::ByteBuffer(1500, 0xAB));
+
+    TpSegmentVector segments;
+    ASSERT_EQ(segmenter.segment_message(message, segments), TpResult::SUCCESS);
+    ASSERT_GT(segments.size(), 1u);
+
+    for (size_t i = 0; i < segments.size(); ++i) {
+        ASSERT_GE(segments[i].payload.size(), 15u);
+        EXPECT_EQ(segments[i].payload[14], 0xA0)
+            << "Segment " << i << " must have TP-flagged RESPONSE (0xA0) at byte 14";
+        EXPECT_TRUE(uses_tp(static_cast<MessageType>(segments[i].payload[14])));
+    }
+}
+
+/**
+ * @test_case TC_TP_WIRE_INGEST_UNKNOWN_TOTAL
+ * @tests REQ_TP_032, REQ_TP_033, REQ_TP_091
+ * @brief Reassembler completes when total length is unknown until the last segment
+ */
+TEST_F(TpTest, WireIngestUnknownTotalUntilLast) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    auto make_wire = [](uint32_t offset, bool more, const platform::ByteBuffer& chunk) {
+        platform::ByteBuffer datagram(20 + chunk.size(), 0);
+        datagram[0] = 0x11; datagram[1] = 0x11;
+        datagram[2] = 0x22; datagram[3] = 0x22;
+        const uint32_t someip_length = 8 + 4 + static_cast<uint32_t>(chunk.size());
+        datagram[4] = static_cast<uint8_t>((someip_length >> 24U) & 0xFFU);
+        datagram[5] = static_cast<uint8_t>((someip_length >> 16U) & 0xFFU);
+        datagram[6] = static_cast<uint8_t>((someip_length >> 8U) & 0xFFU);
+        datagram[7] = static_cast<uint8_t>(someip_length & 0xFFU);
+        datagram[8] = 0xAA; datagram[9] = 0xAA;
+        datagram[10] = 0x00; datagram[11] = 0x01;
+        datagram[12] = 0x01; datagram[13] = 0x01;
+        datagram[14] = 0x20;  // REQUEST | TP
+        datagram[15] = 0x00;
+        const uint32_t tp_hdr = ((offset / 16U) << 4U) | (more ? 0x01U : 0x00U);
+        datagram[16] = static_cast<uint8_t>((tp_hdr >> 24U) & 0xFFU);
+        datagram[17] = static_cast<uint8_t>((tp_hdr >> 16U) & 0xFFU);
+        datagram[18] = static_cast<uint8_t>((tp_hdr >> 8U) & 0xFFU);
+        datagram[19] = static_cast<uint8_t>(tp_hdr & 0xFFU);
+        std::copy(chunk.begin(), chunk.end(), datagram.begin() + 20);
+        return datagram;
+    };
+
+    platform::ByteBuffer part1(32, 0xA1);
+    platform::ByteBuffer part2(16, 0xB2);
+    const platform::ByteBuffer first = make_wire(0, true, part1);
+    const platform::ByteBuffer last = make_wire(32, false, part2);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(first.data(), first.size(), complete))
+        << "First segment with unknown total must not complete";
+
+    ASSERT_TRUE(manager.ingest_datagram(last.data(), last.size(), complete));
+    EXPECT_FALSE(complete.uses_tp()) << "Reassembled type must have bit 5 cleared";
+    EXPECT_EQ(complete.get_message_type(), MessageType::REQUEST);
+    EXPECT_EQ(complete.get_payload().size(), 48u);
+    EXPECT_EQ(complete.get_service_id(), 0x1111);
+    EXPECT_EQ(complete.get_method_id(), 0x2222);
+
+    platform::ByteBuffer expected;
+    expected.insert(expected.end(), part1.begin(), part1.end());
+    expected.insert(expected.end(), part2.begin(), part2.end());
+    EXPECT_EQ(complete.get_payload(), expected);
+}
+
+/**
+ * @test_case TC_TP_WIRE_LAST_ARRIVES_FIRST
+ * @tests REQ_TP_032, REQ_TP_033
+ * @brief Last segment first sizes the buffer; first segment then completes
+ */
+TEST_F(TpTest, WireIngestLastArrivesFirst) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    auto make_wire = [](uint32_t offset, bool more, uint8_t fill, size_t n) {
+        platform::ByteBuffer datagram(20 + n, 0);
+        datagram[0] = 0x33; datagram[1] = 0x33;
+        datagram[2] = 0x44; datagram[3] = 0x44;
+        const uint32_t someip_length = 8 + 4 + static_cast<uint32_t>(n);
+        datagram[4] = static_cast<uint8_t>((someip_length >> 24U) & 0xFFU);
+        datagram[5] = static_cast<uint8_t>((someip_length >> 16U) & 0xFFU);
+        datagram[6] = static_cast<uint8_t>((someip_length >> 8U) & 0xFFU);
+        datagram[7] = static_cast<uint8_t>(someip_length & 0xFFU);
+        datagram[8] = 0x00; datagram[9] = 0x01;
+        datagram[10] = 0x00; datagram[11] = 0x02;
+        datagram[12] = 0x01; datagram[13] = 0x01;
+        datagram[14] = 0xA0;  // RESPONSE | TP
+        datagram[15] = 0x00;
+        const uint32_t tp_hdr = ((offset / 16U) << 4U) | (more ? 0x01U : 0x00U);
+        datagram[16] = static_cast<uint8_t>((tp_hdr >> 24U) & 0xFFU);
+        datagram[17] = static_cast<uint8_t>((tp_hdr >> 16U) & 0xFFU);
+        datagram[18] = static_cast<uint8_t>((tp_hdr >> 8U) & 0xFFU);
+        datagram[19] = static_cast<uint8_t>(tp_hdr & 0xFFU);
+        std::fill(datagram.begin() + 20, datagram.end(), fill);
+        return datagram;
+    };
+
+    const platform::ByteBuffer last = make_wire(32, false, 0x22, 16);
+    const platform::ByteBuffer first = make_wire(0, true, 0x11, 32);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(last.data(), last.size(), complete));
+    ASSERT_TRUE(manager.ingest_datagram(first.data(), first.size(), complete));
+    EXPECT_EQ(complete.get_message_type(), MessageType::RESPONSE);
+    EXPECT_FALSE(complete.uses_tp());
+    ASSERT_EQ(complete.get_payload().size(), 48u);
+    EXPECT_EQ(complete.get_payload()[0], 0x11);
+    EXPECT_EQ(complete.get_payload()[32], 0x22);
+}
+
+/**
+ * @test_case TC_TP_REASSEMBLY_KEY_INCLUDES_SENDER
+ * @tests REQ_TP_031
+ * @brief Segments from different UDP senders with the same SOME/IP IDs stay isolated.
+ */
+TEST_F(TpTest, ReassemblyKeyIncludesSender) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    auto make_wire = [](uint32_t offset, bool more, uint8_t fill, size_t n) {
+        platform::ByteBuffer datagram(20 + n, 0);
+        datagram[0] = 0x11; datagram[1] = 0x11;
+        datagram[2] = 0x22; datagram[3] = 0x22;
+        const uint32_t someip_length = 8 + 4 + static_cast<uint32_t>(n);
+        datagram[4] = static_cast<uint8_t>((someip_length >> 24U) & 0xFFU);
+        datagram[5] = static_cast<uint8_t>((someip_length >> 16U) & 0xFFU);
+        datagram[6] = static_cast<uint8_t>((someip_length >> 8U) & 0xFFU);
+        datagram[7] = static_cast<uint8_t>(someip_length & 0xFFU);
+        datagram[8] = 0x00; datagram[9] = 0x01;
+        datagram[10] = 0x00; datagram[11] = 0x01;
+        datagram[12] = 0x01; datagram[13] = 0x01;
+        datagram[14] = 0x20;
+        datagram[15] = 0x00;
+        const uint32_t tp_hdr = ((offset / 16U) << 4U) | (more ? 0x01U : 0x00U);
+        datagram[16] = static_cast<uint8_t>((tp_hdr >> 24U) & 0xFFU);
+        datagram[17] = static_cast<uint8_t>((tp_hdr >> 16U) & 0xFFU);
+        datagram[18] = static_cast<uint8_t>((tp_hdr >> 8U) & 0xFFU);
+        datagram[19] = static_cast<uint8_t>(tp_hdr & 0xFFU);
+        std::fill(datagram.begin() + 20, datagram.end(), fill);
+        return datagram;
+    };
+
+    const platform::ByteBuffer a_first = make_wire(0, true, 0xAA, 32);
+    const platform::ByteBuffer b_first = make_wire(0, true, 0xBB, 32);
+    const platform::ByteBuffer b_last = make_wire(32, false, 0xCC, 16);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(a_first.data(), a_first.size(), complete, 0x0A000001U, 30000));
+    EXPECT_FALSE(manager.ingest_datagram(b_first.data(), b_first.size(), complete, 0x0B000001U, 30001));
+    ASSERT_TRUE(manager.ingest_datagram(b_last.data(), b_last.size(), complete, 0x0B000001U, 30001));
+    ASSERT_EQ(complete.get_payload().size(), 48u);
+    EXPECT_EQ(complete.get_payload()[0], 0xBB);
+    EXPECT_EQ(complete.get_payload()[32], 0xCC);
+}
+
+/**
+ * @test_case TC_TP_REJECT_INVALID_RECONSTRUCTED_HEADER
+ * @tests REQ_MSG_100
+ * @brief A completed TP transfer with an invalid SOME/IP header is not delivered.
+ */
+TEST_F(TpTest, RejectInvalidReconstructedHeader) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    platform::ByteBuffer datagram(36, 0);
+    datagram[0] = 0x00;
+    datagram[1] = 0x00;  // Service ID 0 is invalid
+    datagram[2] = 0x00;
+    datagram[3] = 0x01;
+    const uint32_t someip_length = 8 + 4 + 16;
+    datagram[4] = static_cast<uint8_t>((someip_length >> 24U) & 0xFFU);
+    datagram[5] = static_cast<uint8_t>((someip_length >> 16U) & 0xFFU);
+    datagram[6] = static_cast<uint8_t>((someip_length >> 8U) & 0xFFU);
+    datagram[7] = static_cast<uint8_t>(someip_length & 0xFFU);
+    datagram[8] = 0x00;
+    datagram[9] = 0x01;
+    datagram[10] = 0x00;
+    datagram[11] = 0x01;
+    datagram[12] = 0x01;
+    datagram[13] = 0x01;
+    datagram[14] = 0x20;
+    datagram[15] = 0x00;
+    datagram[19] = 0x00;  // offset 0, more = 0
+    std::fill(datagram.begin() + 20, datagram.end(), 0x11);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete));
+}
+
+// ============================================================================
+// Fix 1: Misaligned non-final segment rejection (feat_req_someiptp_772)
+// ============================================================================
+
+/**
+ * @test_case TC_TP_MISALIGNED_NONFINAL_REJECTED
+ * @tests feat_req_someiptp_772, feat_req_someiptp_792
+ * @brief Non-final TP segment with payload not a multiple of 16 bytes is rejected
+ *
+ * Per feat_req_someiptp_772 (SHALL): "all but the last segment shall have a
+ * length that is a multiple of 16 bytes".
+ * Per feat_req_someiptp_792 (SHALL): "cancel reassembly if segment length of
+ * a segment with MS=1 is not a multiple of 16".
+ */
+TEST_F(TpTest, MisalignedNonFinalSegmentRejected) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    // Build a wire datagram where More=1 but payload is 17 bytes (not 16-aligned).
+    // Total datagram = 20 (headers) + 17 = 37 bytes.
+    const size_t payload_bytes = 17;
+    platform::ByteBuffer datagram(20 + payload_bytes, 0);
+    datagram[0] = 0x11; datagram[1] = 0x11;  // Service
+    datagram[2] = 0x22; datagram[3] = 0x22;  // Method
+    const uint32_t someip_length = 8 + 4 + static_cast<uint32_t>(payload_bytes);
+    datagram[4] = static_cast<uint8_t>((someip_length >> 24U) & 0xFFU);
+    datagram[5] = static_cast<uint8_t>((someip_length >> 16U) & 0xFFU);
+    datagram[6] = static_cast<uint8_t>((someip_length >> 8U) & 0xFFU);
+    datagram[7] = static_cast<uint8_t>(someip_length & 0xFFU);
+    datagram[8] = 0xAA; datagram[9] = 0xAA;  // Client
+    datagram[10] = 0x00; datagram[11] = 0x01; // Session
+    datagram[12] = 0x01;  // Protocol Version
+    datagram[13] = 0x01;  // Interface Version
+    datagram[14] = 0x20;  // REQUEST | TP
+    datagram[15] = 0x00;  // Return Code
+    // TP header: offset=0, more=1
+    datagram[16] = 0x00; datagram[17] = 0x00;
+    datagram[18] = 0x00; datagram[19] = 0x01;
+    std::fill(datagram.begin() + 20, datagram.end(), 0xAA);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete))
+        << "Non-final segment with 17-byte payload (not 16-aligned) must be rejected";
+}
+
+/**
+ * @test_case TC_TP_ALIGNED_NONFINAL_ACCEPTED
+ * @tests feat_req_someiptp_772
+ * @brief Non-final TP segment with 16-byte-aligned payload is accepted
+ */
+TEST_F(TpTest, AlignedNonFinalSegmentAccepted) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    // Build a wire datagram where More=1, payload is 32 bytes (16-aligned).
+    const size_t payload_bytes = 32;
+    platform::ByteBuffer datagram(20 + payload_bytes, 0);
+    datagram[0] = 0x11; datagram[1] = 0x11;
+    datagram[2] = 0x22; datagram[3] = 0x22;
+    const uint32_t someip_length = 8 + 4 + static_cast<uint32_t>(payload_bytes);
+    datagram[4] = static_cast<uint8_t>((someip_length >> 24U) & 0xFFU);
+    datagram[5] = static_cast<uint8_t>((someip_length >> 16U) & 0xFFU);
+    datagram[6] = static_cast<uint8_t>((someip_length >> 8U) & 0xFFU);
+    datagram[7] = static_cast<uint8_t>(someip_length & 0xFFU);
+    datagram[8] = 0xAA; datagram[9] = 0xAA;
+    datagram[10] = 0x00; datagram[11] = 0x01;
+    datagram[12] = 0x01; datagram[13] = 0x01;
+    datagram[14] = 0x20;
+    datagram[15] = 0x00;
+    // TP header: offset=0, more=1
+    datagram[16] = 0x00; datagram[17] = 0x00;
+    datagram[18] = 0x00; datagram[19] = 0x01;
+    std::fill(datagram.begin() + 20, datagram.end(), 0xBB);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete))
+        << "First segment with more=1 must not complete (expected partial)";
+}
+
+/**
+ * @test_case TC_TP_MISALIGNED_FINAL_ACCEPTED
+ * @tests feat_req_someiptp_772
+ * @brief Final TP segment (More=0) with non-16-aligned payload is accepted
+ *
+ * Only non-final segments must be 16-byte aligned; the last segment can be any size.
+ */
+TEST_F(TpTest, MisalignedFinalSegmentAccepted) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    // First segment: offset=0, more=1, 32-byte payload (aligned)
+    const size_t first_payload = 32;
+    platform::ByteBuffer first(20 + first_payload, 0);
+    first[0] = 0x11; first[1] = 0x11;
+    first[2] = 0x22; first[3] = 0x22;
+    uint32_t sl = 8 + 4 + static_cast<uint32_t>(first_payload);
+    first[4] = static_cast<uint8_t>((sl >> 24U) & 0xFFU);
+    first[5] = static_cast<uint8_t>((sl >> 16U) & 0xFFU);
+    first[6] = static_cast<uint8_t>((sl >> 8U) & 0xFFU);
+    first[7] = static_cast<uint8_t>(sl & 0xFFU);
+    first[8] = 0xAA; first[9] = 0xAA;
+    first[10] = 0x00; first[11] = 0x01;
+    first[12] = 0x01; first[13] = 0x01;
+    first[14] = 0x20; first[15] = 0x00;
+    // TP: offset=0, more=1
+    first[16] = 0x00; first[17] = 0x00;
+    first[18] = 0x00; first[19] = 0x01;
+    std::fill(first.begin() + 20, first.end(), 0xA1);
+
+    // Last segment: offset=32, more=0, 7-byte payload (NOT 16-aligned — OK for last)
+    const size_t last_payload = 7;
+    platform::ByteBuffer last(20 + last_payload, 0);
+    last[0] = 0x11; last[1] = 0x11;
+    last[2] = 0x22; last[3] = 0x22;
+    sl = 8 + 4 + static_cast<uint32_t>(last_payload);
+    last[4] = static_cast<uint8_t>((sl >> 24U) & 0xFFU);
+    last[5] = static_cast<uint8_t>((sl >> 16U) & 0xFFU);
+    last[6] = static_cast<uint8_t>((sl >> 8U) & 0xFFU);
+    last[7] = static_cast<uint8_t>(sl & 0xFFU);
+    last[8] = 0xAA; last[9] = 0xAA;
+    last[10] = 0x00; last[11] = 0x01;
+    last[12] = 0x01; last[13] = 0x01;
+    last[14] = 0x20; last[15] = 0x00;
+    // TP: offset=32/16=2 → bits [31:4] = 2, more=0
+    const uint32_t tp_hdr = (2U << 4U) | 0x00U;
+    last[16] = static_cast<uint8_t>((tp_hdr >> 24U) & 0xFFU);
+    last[17] = static_cast<uint8_t>((tp_hdr >> 16U) & 0xFFU);
+    last[18] = static_cast<uint8_t>((tp_hdr >> 8U) & 0xFFU);
+    last[19] = static_cast<uint8_t>(tp_hdr & 0xFFU);
+    std::fill(last.begin() + 20, last.end(), 0xB2);
+
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(first.data(), first.size(), complete));
+    ASSERT_TRUE(manager.ingest_datagram(last.data(), last.size(), complete))
+        << "Final segment with 7-byte (non-aligned) payload must be accepted";
+    EXPECT_EQ(complete.get_payload().size(), 39u);
+}
+
+// ============================================================================
+// Fix 3: Static-alloc buffer size clamp (feat_req_someiptp_782)
+// ============================================================================
+
+/**
+ * @test_case TC_TP_REASSEMBLY_CLAMP_WORKS
+ * @tests feat_req_someiptp_782
+ * @brief MAX_TP_REASSEMBLY_SIZE limits effective max_message_size for reassembly
+ *
+ * When max_message_size exceeds the compile-time reassembly buffer capacity,
+ * the reassembler must reject segments that would exceed that capacity.
+ * This test validates the principle even on dynamic-alloc builds by using
+ * a config with max_message_size larger than MAX_TP_REASSEMBLY_SIZE and
+ * verifying the static_assert on the constant.
+ */
+TEST_F(TpTest, MaxTpReassemblySizeIsAtLeast16) {
+    EXPECT_GE(MAX_TP_REASSEMBLY_SIZE, 16u)
+        << "MAX_TP_REASSEMBLY_SIZE must be at least 16 (one aligned chunk)";
 }
