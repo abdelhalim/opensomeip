@@ -23,6 +23,7 @@
 #include "tp/tp_types.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -95,7 +96,7 @@ TpResult TpManager::segment_message(const Message& message, uint32_t& transfer_i
         return TpResult::RESOURCE_EXHAUSTED;
     }
     active_transfers_[transfer_id] = std::move(transfer);
-    statistics_.messages_segmented++;
+    sender_statistics_.messages_segmented.fetch_add(1, std::memory_order_relaxed);
 
     return TpResult::SUCCESS;
 }
@@ -124,7 +125,7 @@ TpResult TpManager::get_next_segment(uint32_t transfer_id, TpSegment& segment) {
     transfer.next_segment_to_send++;
     transfer.last_activity = std::chrono::steady_clock::now();
 
-    statistics_.segments_sent++;
+    sender_statistics_.segments_sent.fetch_add(1, std::memory_order_relaxed);
 
     return TpResult::SUCCESS;
 }
@@ -136,7 +137,7 @@ TpResult TpManager::get_next_segment(uint32_t transfer_id, TpSegment& segment) {
  */
 bool TpManager::handle_received_segment(const TpSegment& segment, platform::ByteBuffer& complete_message) {
     // Update statistics
-    statistics_.segments_received++;
+    receiver_statistics_.segments_received.fetch_add(1, std::memory_order_relaxed);
 
     if (segment.header.message_type == TpMessageType::SINGLE_MESSAGE) {
         if (segment.header.segment_length != segment.payload.size()) {
@@ -186,6 +187,11 @@ bool assemble_message_from_tp(const std::array<uint8_t, 16>& hdr,
 
 }  // namespace
 
+/**
+ * @brief Ingest a raw TP datagram and produce a reassembled Message
+ * @implements REQ_TP_055, REQ_TP_078, REQ_TP_091
+ * @satisfies feat_req_someiptp_785
+ */
 bool TpManager::ingest_datagram(const uint8_t* data, size_t size, Message& out_complete,
                                 uint32_t sender_ipv4, uint16_t sender_port) {
     TpSegment segment;
@@ -195,41 +201,42 @@ bool TpManager::ingest_datagram(const uint8_t* data, size_t size, Message& out_c
     segment.sender_ipv4 = sender_ipv4;
     segment.sender_port = sender_port;
 
-    statistics_.segments_received++;
+    receiver_statistics_.segments_received.fetch_add(1, std::memory_order_relaxed);
 
     if (!reassembler_) {
         return false;
     }
 
+    // Retrieve payload and SOME/IP header atomically from the reassembler
+    // so that concurrent ingest_datagram() calls cannot pair the wrong
+    // header with a payload (issue #327).
+    std::array<uint8_t, 16> hdr{};
     platform::ByteBuffer complete_payload;
-    if (!reassembler_->process_segment(segment, complete_payload)) {
+    if (!reassembler_->process_segment(segment, complete_payload, &hdr)) {
         return false;
     }
     if (complete_payload.empty()) {
         return false;
     }
 
-    statistics_.messages_reassembled++;
-
-    std::array<uint8_t, 16> hdr{};
-    if (!reassembler_->copy_last_completed_someip_header(hdr)) {
-        if (data == nullptr || size < 16) {
-            return false;
-        }
-        std::memcpy(hdr.data(), data, 16);
-    }
+    receiver_statistics_.messages_reassembled.fetch_add(1, std::memory_order_relaxed);
 
     return assemble_message_from_tp(hdr, complete_payload, out_complete);
 }
 
+/**
+ * @brief Segment a message and return wire datagrams
+ * @implements REQ_TP_050, REQ_TP_090
+ */
 TpResult TpManager::segment_and_serialize(const Message& message, TpSegmentVector& segments) {
     if (!segmenter_) {
         return TpResult::RESOURCE_EXHAUSTED;
     }
     TpResult const result = segmenter_->segment_message(message, segments);
     if (result == TpResult::SUCCESS) {
-        statistics_.messages_segmented++;
-        statistics_.segments_sent += static_cast<uint32_t>(segments.size());
+        sender_statistics_.messages_segmented.fetch_add(1, std::memory_order_relaxed);
+        sender_statistics_.segments_sent.fetch_add(
+            static_cast<uint32_t>(segments.size()), std::memory_order_relaxed);
     }
     return result;
 }
@@ -289,6 +296,9 @@ void TpManager::set_message_callback(TpMessageCallback callback) {
     message_callback_ = std::move(callback);
 }
 
+/**
+ * @brief Process timeouts and cleanup stale transfers
+ */
 void TpManager::process_timeouts() {
     platform::Vector<std::pair<uint32_t, TpResult>> timed_out;
     TpCompletionCallback cb;
@@ -307,7 +317,7 @@ void TpManager::process_timeouts() {
 
             if (elapsed > config_.reassembly_timeout) {
                 transfer.state = TpTransferState::TIMEOUT;
-                statistics_.timeouts++;
+                sender_statistics_.timeouts.fetch_add(1, std::memory_order_relaxed);
                 timed_out.emplace_back(transfer.transfer_id, TpResult::TIMEOUT);
                 it = active_transfers_.erase(it);
             } else {
@@ -329,11 +339,19 @@ void TpManager::process_timeouts() {
 }
 
 /**
- * @brief Get TP statistics
- * @implements REQ_TP_060, REQ_TP_061, REQ_TP_062, REQ_TP_063
+ * @brief Get sender-path TP statistics
+ * @implements REQ_TP_060, REQ_TP_061
  */
-TpStatistics TpManager::get_statistics() const {
-    return statistics_;
+TpStatistics TpManager::get_sender_statistics() const {
+    return sender_statistics_.snapshot();
+}
+
+/**
+ * @brief Get receiver-path TP statistics
+ * @implements REQ_TP_062, REQ_TP_063
+ */
+TpStatistics TpManager::get_receiver_statistics() const {
+    return receiver_statistics_.snapshot();
 }
 
 /**

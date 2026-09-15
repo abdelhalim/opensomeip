@@ -17,7 +17,6 @@
 #include "platform/thread.h"
 #include "tp/tp_types.h"
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -216,8 +215,10 @@ TpReassembler::~TpReassembler() {
  * @implements REQ_TP_030, REQ_TP_031, REQ_TP_032, REQ_TP_033
  * @implements REQ_TP_030_E01, REQ_TP_076, REQ_TP_077, REQ_TP_078
  * @implements REQ_TP_079, REQ_TP_080, REQ_TP_081, REQ_TP_082
+ * @implements feat_req_someiptp_797
  */
-bool TpReassembler::process_segment(const TpSegment& segment, platform::ByteBuffer& complete_message) {
+bool TpReassembler::process_segment(const TpSegment& segment, platform::ByteBuffer& complete_message,
+                                     std::array<uint8_t, 16>* out_someip_header) {
     if (!validate_segment(segment)) {
         return false;
     }
@@ -250,6 +251,15 @@ bool TpReassembler::process_segment(const TpSegment& segment, platform::ByteBuff
         if (buffer->has_someip_header) {
             last_completed_someip_header_ = buffer->someip_header;
             has_last_completed_someip_header_ = true;
+            if (out_someip_header != nullptr) {
+                *out_someip_header = buffer->someip_header;
+            }
+        } else {
+            // Invariant: every accepted segment stores a SOME/IP header before
+            // the buffer can complete.  If this is violated, the completed
+            // message would carry an uninitialised header — discard it.
+            reassembly_buffers_.erase(key);
+            return false;
         }
         reassembly_buffers_.erase(key);
         return true;
@@ -390,6 +400,7 @@ TpReassemblyBuffer* TpReassembler::find_or_create_buffer(const TpSegment& segmen
  * @brief Add segment to reassembly buffer
  * @implements REQ_TP_039, REQ_TP_040, REQ_TP_041, REQ_TP_042, REQ_TP_043
  * @implements REQ_TP_039_E01, REQ_TP_080, REQ_TP_081
+ * @implements feat_req_someiptp_797
  */
 bool TpReassembler::add_segment_to_buffer(TpReassemblyBuffer& buffer, const TpSegment& segment,
                                           uint32_t max_message_size) {
@@ -410,9 +421,16 @@ bool TpReassembler::add_segment_to_buffer(TpReassemblyBuffer& buffer, const TpSe
             return false;
         }
 
-        std::copy(segment.payload.begin() + static_cast<std::ptrdiff_t>(header_size),
-                 segment.payload.end(),
-                 buffer.received_data.begin());
+        // feat_req_someiptp_797: first-wins — only write bytes not already received
+        {
+            const auto* src = segment.payload.data() + header_size;
+            for (size_t i = 0; i < bytes; ++i) {
+                if (i < buffer.received_segments.size() && buffer.received_segments[i]) {
+                    continue;
+                }
+                buffer.received_data[i] = src[i];
+            }
+        }
         buffer.mark_segment_received(0, static_cast<uint32_t>(bytes));
         buffer.last_sequence_number = segment.header.sequence_number;
         buffer.last_segment_seen = true;
@@ -472,9 +490,17 @@ bool TpReassembler::add_segment_to_buffer(TpReassemblyBuffer& buffer, const TpSe
         }
     }
 
-    std::copy(segment.payload.begin() + static_cast<std::ptrdiff_t>(TP_OVERHEAD),
-             segment.payload.end(),
-             buffer.received_data.begin() + static_cast<std::ptrdiff_t>(wire_offset));
+    // feat_req_someiptp_797: first-wins — only write bytes not already received
+    {
+        const auto* src = segment.payload.data() + TP_OVERHEAD;
+        for (uint32_t i = 0; i < bytes; ++i) {
+            const auto buf_idx = static_cast<size_t>(wire_offset) + i;
+            if (buf_idx < buffer.received_segments.size() && buffer.received_segments[buf_idx]) {
+                continue;
+            }
+            buffer.received_data[buf_idx] = src[i];
+        }
+    }
     buffer.mark_segment_received(wire_offset, bytes);
     buffer.last_sequence_number = segment.header.sequence_number;
     store_someip_header(buffer, segment, !wire_more);

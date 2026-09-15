@@ -21,6 +21,7 @@
 #include "platform/thread.h"
 
 #include "../someip/message.h"
+#include <atomic>
 #include <cstddef>
 #include <optional>
 
@@ -28,6 +29,49 @@
 #include "tp_reassembler.h"
 
 namespace someip::tp {
+
+/**
+ * @brief Atomic statistics counters for lock-free diagnostic reads.
+ *
+ * All fields use @c std::atomic<uint32_t> with @c memory_order_relaxed so
+ * that a diagnostic thread can call @c get_sender_statistics() or
+ * @c get_receiver_statistics() without locking, while the owning path
+ * (send or receive) is actively incrementing.
+ *
+ * Reads (snapshots) use relaxed loads, which on ARM and x86 compile to
+ * plain load instructions.  Writes use @c fetch_add with relaxed
+ * ordering, which is an atomic read-modify-write; the generated
+ * instructions and cost depend on the compiler and target (e.g.
+ * @c lock @c xadd on x86, @c ldxr/@c stxr loop on ARM).
+ */
+struct AtomicTpStatistics {
+    std::atomic<uint32_t> messages_segmented{0};
+    std::atomic<uint32_t> messages_reassembled{0};
+    std::atomic<uint32_t> segments_sent{0};
+    std::atomic<uint32_t> segments_received{0};
+    std::atomic<uint32_t> retransmissions{0};
+    std::atomic<uint32_t> timeouts{0};
+    std::atomic<uint32_t> errors{0};
+
+    /**
+     * @brief Return a point-in-time snapshot as a plain copyable POD struct.
+     *
+     * Each field is read with @c memory_order_relaxed; the snapshot is not
+     * guaranteed to be a consistent cut across all fields, but each
+     * individual counter is race-free.
+     */
+    TpStatistics snapshot() const {
+        return {
+            messages_segmented.load(std::memory_order_relaxed),
+            messages_reassembled.load(std::memory_order_relaxed),
+            segments_sent.load(std::memory_order_relaxed),
+            segments_received.load(std::memory_order_relaxed),
+            retransmissions.load(std::memory_order_relaxed),
+            timeouts.load(std::memory_order_relaxed),
+            errors.load(std::memory_order_relaxed)
+        };
+    }
+};
 
 /**
  * @brief SOME/IP Transport Protocol Manager
@@ -176,11 +220,27 @@ public:
     void process_timeouts();
 
     /**
-     * @brief Get TP statistics
+     * @brief Get sender-path statistics (segmentation) — point-in-time snapshot
      *
-     * @return Current statistics
+     * Returns a plain @c TpStatistics with the current values of counters
+     * written by the sender path: @c messages_segmented, @c segments_sent,
+     * @c errors.  Safe to call concurrently from any thread.
+     *
+     * @return Snapshot of sender statistics
      */
-    TpStatistics get_statistics() const;
+    TpStatistics get_sender_statistics() const;
+
+    /**
+     * @brief Get receiver-path statistics (reassembly) — point-in-time snapshot
+     *
+     * Returns a plain @c TpStatistics with the current values of counters
+     * written by the receiver path: @c messages_reassembled,
+     * @c segments_received, @c timeouts, @c retransmissions, @c errors.
+     * Safe to call concurrently from any thread.
+     *
+     * @return Snapshot of receiver statistics
+     */
+    TpStatistics get_receiver_statistics() const;
 
     /**
      * @brief Update TP configuration
@@ -202,10 +262,10 @@ private:
     TpMessageCallback message_callback_;
 
     uint32_t next_transfer_id_{1};
-    TpStatistics statistics_;
+    AtomicTpStatistics sender_statistics_;
+    AtomicTpStatistics receiver_statistics_;
 
     void cleanup_completed_transfers();
-    void update_statistics(const TpSegment& segment, bool sent);
 };
 
 }  // namespace someip::tp

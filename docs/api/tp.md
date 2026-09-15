@@ -147,6 +147,30 @@ reassemble without going through UDP.
 
 ## Receiver Validation
 
+### Overlapping segment handling — first-wins (feat_req_someiptp_797)
+
+When a received TP segment overlaps with bytes that were already written
+to the reassembly buffer, the reassembler applies **first-wins**
+semantics: only bytes that have not yet been received are written; bytes
+already present are preserved.  This prevents mixed-payload messages when
+a retransmitted or duplicated segment carries different data for the
+overlapping region.
+
+- Exact duplicates (`is_segment_received` returns true for the full
+  range) are accepted and silently ignored — no data is rewritten.
+- Partial overlaps write only the new byte positions and skip the
+  already-received ones.
+
+### Atomic header + payload completion
+
+`process_segment()` now returns the 16-byte SOME/IP header alongside the
+completed payload via an optional output parameter (`out_someip_header`).
+`TpManager::ingest_datagram()` uses this parameter instead of the
+separate `copy_last_completed_someip_header()` call, ensuring the header
+and payload are retrieved atomically under the reassembly lock.  This
+eliminates a race where concurrent `ingest_datagram()` calls could pair
+the wrong header with a payload.
+
 ### Non-final segment alignment (feat_req_someiptp_772, feat_req_someiptp_792)
 
 All non-final TP segments (More Segments = 1) **must** have a payload
@@ -165,6 +189,33 @@ at construction and on `update_config()`, so transfers that would
 exceed the buffer are rejected early rather than silently failing.
 A `static_assert` in `tp_types.h` guards against nonsensical
 compile-time configurations.
+
+## Statistics and Monitoring
+
+`TpManager` provides separate statistics for the sender and receiver paths,
+allowing concurrent diagnostic reads without locks or data races.
+
+### Sender statistics — `get_sender_statistics()`
+
+Returns a point-in-time snapshot of counters written by the segmentation
+path: `messages_segmented`, `segments_sent`, `errors`.  Call from any
+thread; the read is atomic (relaxed ordering).
+
+### Receiver statistics — `get_receiver_statistics()`
+
+Returns a point-in-time snapshot of counters written by the reassembly
+path: `messages_reassembled`, `segments_received`, `timeouts`,
+`retransmissions`, `errors`.
+
+### Thread-safety model
+
+Counters are stored in `AtomicTpStatistics` instances using
+`std::atomic<uint32_t>` with `memory_order_relaxed`.  Each path writes
+exclusively to its own instance, so cross-thread writes never occur.  The
+atomics guard only against a concurrent read (diagnostic query) while the
+owning path is incrementing.  Reads (snapshots) use relaxed loads;
+writes use `fetch_add` with relaxed ordering — the generated instructions
+and cost depend on the compiler and target.
 
 ## Error Handling
 
