@@ -202,6 +202,10 @@
   connection's I/O lock.
 - **TCP**: `SOMEIP_MAX_TCP_CONNECTIONS` of 0 is now rejected at compile
   time instead of building a server that refuses every connection.
+- **TCP**: `connect()` on a server-mode transport always returns
+  `INVALID_STATE`. The mode guard now runs before the already-connected
+  short-circuit, which any ACTIVE slot — including an accepted peer — had
+  been satisfying, so a serving server incorrectly returned `SUCCESS`.
 
 ### Interop Notes
 

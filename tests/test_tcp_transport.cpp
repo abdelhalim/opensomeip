@@ -1187,6 +1187,53 @@ struct ConnectedClient {
 }  // namespace
 
 /**
+ * @test_case TC_TCP_SERVER_MODE_CONNECT
+ * @tests REQ_TRANSPORT_003b
+ * @brief A server refuses connect() even while it holds an accepted peer
+ *
+ * is_connected() reports true as soon as any slot is ACTIVE. A server that has
+ * accepted a client therefore satisfied the "already connected" short-circuit
+ * and returned SUCCESS before the mode guard was ever reached.
+ */
+TEST_F(TcpTransportTest, ServerModeConnectRejectedWhilePeerConnected) {
+    TcpTransport server(config);
+    ASSERT_EQ(server.initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
+    ASSERT_EQ(server.enable_server_mode(), Result::SUCCESS);
+
+    TestTcpListener server_listener;
+    server.set_listener(&server_listener);
+    ASSERT_EQ(server.start(), Result::SUCCESS);
+
+    const Endpoint server_ep = server.get_local_endpoint();
+    const Endpoint unrelated_ep("127.0.0.1", 30599);
+
+    // With no peer yet, is_connected() is false and only the mode guard applies.
+    EXPECT_EQ(server.connect(unrelated_ep), Result::INVALID_STATE)
+        << "an idle server must refuse to act as a client";
+
+    TcpTransport client(config);
+    TestTcpListener client_listener;
+    ASSERT_EQ(client.initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
+    client.set_listener(&client_listener);
+    ASSERT_EQ(client.start(), Result::SUCCESS);
+    ASSERT_EQ(client.connect(server_ep), Result::SUCCESS);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (server.connection_count() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_EQ(server.connection_count(), 1U) << "server must have accepted the client";
+    ASSERT_TRUE(server.is_connected()) << "an accepted peer makes is_connected() true";
+
+    // The short-circuit is now live, so this is the ordering the fix guarantees.
+    EXPECT_EQ(server.connect(unrelated_ep), Result::INVALID_STATE)
+        << "a serving server must still refuse to act as a client";
+
+    client.stop();
+    server.stop();
+}
+
+/**
  * @test_case TC_TCP_MULTI_CLIENT
  * @tests REQ_TRANSPORT_003b
  * @brief A TCP server serves several clients at the same time (issue #319)
