@@ -1784,8 +1784,9 @@ TEST_F(TcpTransportTest, MaxConnectionsClampedToCompileTimeCapacity) {
 
     TcpTransportConfig under = config;
     under.max_connections = 2;
-    TcpTransport small(under);
-    EXPECT_EQ(small.max_connections(), 2U) << "a limit below capacity is left alone";
+    // Not named `small`: the Windows SDK's rpcndr.h defines `small` as `char`.
+    TcpTransport compact(under);
+    EXPECT_EQ(compact.max_connections(), 2U) << "a limit below capacity is left alone";
 }
 
 /**
