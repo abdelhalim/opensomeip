@@ -33,6 +33,7 @@ enum class RpcResult : uint8_t {
     INVALID_PARAMETERS,
     METHOD_NOT_FOUND,
     SERVICE_NOT_AVAILABLE,
+    WRONG_INTERFACE_VERSION,  // Response IV doesn't match configured major
     INTERNAL_ERROR
 };
 
@@ -45,6 +46,19 @@ using RpcCallHandle = uint32_t;
  * @brief Method ID type for RPC calls
  */
 using MethodId = uint16_t;
+
+/**
+ * @brief Default unicast port for application RPC (not the SD port 30490)
+ */
+static constexpr uint16_t SOMEIP_DEFAULT_RPC_PORT = 30501;
+
+/**
+ * @brief Method call semantics advertised by RpcServer::register_method
+ */
+enum class MethodSemantics : uint8_t {
+    REQUEST_RESPONSE,
+    FIRE_AND_FORGET
+};
 
 /**
  * @brief Timeout configuration for RPC calls
