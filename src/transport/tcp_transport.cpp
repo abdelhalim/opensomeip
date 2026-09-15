@@ -152,10 +152,9 @@ MessagePtr TcpTransport::receive_message() {
 }
 
 Result TcpTransport::connect(const Endpoint& endpoint) {
-    if (is_connected()) {
-        return Result::SUCCESS;  // Already connected
-    }
-
+    // The mode guard has to run before is_connected(): any accepted peer puts a
+    // slot in ACTIVE, so a server that has served one client would otherwise
+    // report SUCCESS here instead of refusing to act as a client.
     bool server_mode = false;
     {
         platform::ScopedLock const lock(table_mutex_);
@@ -163,6 +162,10 @@ Result TcpTransport::connect(const Endpoint& endpoint) {
     }
     if (server_mode) {
         return Result::INVALID_STATE;  // Server mode doesn't connect
+    }
+
+    if (is_connected()) {
+        return Result::SUCCESS;  // Already connected
     }
 
     return connect_internal(endpoint);
