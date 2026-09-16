@@ -134,7 +134,10 @@ jobs:
           exit-on-fail: false
 
       - name: Create Python Test Check Run
-        if: always()
+        # Fork PRs get a read-only GITHUB_TOKEN, so creating a check run 403s and
+        # would fail this job even when python-tests passed. Job summaries from
+        # the steps above still publish the report.
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
