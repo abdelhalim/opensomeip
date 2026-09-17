@@ -78,6 +78,8 @@ public:
 
     OutboundConnectingGuard(const OutboundConnectingGuard&) = delete;
     OutboundConnectingGuard& operator=(const OutboundConnectingGuard&) = delete;
+    OutboundConnectingGuard(OutboundConnectingGuard&&) = delete;
+    OutboundConnectingGuard& operator=(OutboundConnectingGuard&&) = delete;
 
 private:
     std::atomic<bool>& flag_;
