@@ -2252,9 +2252,18 @@ TEST_F(TcpTransportTest, ClientSendToStalledPeerWaitsWithoutSpinning) {
 
     EXPECT_NE(last, Result::SUCCESS) << "the stalled peer should have blocked a send";
     ASSERT_GT(wall_ms, 0);
+#if defined(_WIN32)
+    // std::clock() is process-wide on Windows (kernel+user across threads), so
+    // the POSIX "CPU << wall" ratio is not a spin detector here. Require the
+    // send to have waited a meaningful fraction of send_timeout instead.
+    EXPECT_GE(wall_ms, slow.send_timeout.count() / 2)
+        << "client-mode send returned immediately instead of waiting: " << wall_ms
+        << "ms wall, " << cpu_ms << "ms CPU";
+#else
     EXPECT_LT(cpu_ms * 2, wall_ms)
         << "client-mode send spun instead of waiting: " << cpu_ms << "ms CPU over " << wall_ms
         << "ms";
+#endif
 
     someip_close_socket(accepted_fd);
     someip_close_socket(listen_fd);
