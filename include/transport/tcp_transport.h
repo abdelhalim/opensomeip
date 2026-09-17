@@ -129,8 +129,9 @@ public:
      * @brief Send a message to one connected peer
      *
      * The message is sent on the connection whose remote endpoint matches
-     * @p endpoint by address and port. A server therefore addresses each of its
-     * peers individually; a client names the endpoint it connected to.
+     * @p endpoint (address, port, and TCP protocol). A server therefore
+     * addresses each of its peers individually; a client names the endpoint
+     * it connected to.
      *
      * @param message The message to send
      * @param endpoint The destination endpoint
@@ -157,6 +158,19 @@ public:
      * @see set_listener()
      */
     MessagePtr receive_message() override;
+
+    /**
+     * @brief Receive a message with sender endpoint (non-blocking, polling mode)
+     *
+     * Like receive_message(), this only returns messages when no listener is
+     * installed. Use this variant when a multi-peer TCP server needs the
+     * originating endpoint for reply addressing without a full listener.
+     *
+     * @param[out] sender Filled with the sender's endpoint on success
+     * @return Received message or nullptr if no message available
+     * @see ITransport::set_listener(), ITransport::receive_message()
+     */
+    MessagePtr receive_message_with_sender(Endpoint& sender);
 
     /**
      * @brief Connect to a remote endpoint
@@ -218,10 +232,10 @@ public:
      *
      * A server may serve several peers at once, so this collapses the whole
      * table to one value: CONNECTED if any peer is connected, otherwise
-     * DISCONNECTING if any peer is being torn down, otherwise DISCONNECTED.
-     * CONNECTING is never reported here, because an outbound connection occupies
-     * no slot until it completes and connect() blocks for its duration. Use
-     * connection_count() or is_peer_connected() to inspect individual peers.
+     * CONNECTING while an outbound connect() handshake is in progress,
+     * otherwise DISCONNECTING if any peer is being torn down, otherwise
+     * DISCONNECTED. Use connection_count() or is_peer_connected() to inspect
+     * individual peers.
      *
      * @return Aggregate connection state
      */
@@ -282,12 +296,6 @@ public:
     Result enable_server_mode(int backlog = 5);
 
     /**
-     * @brief Accept incoming connection (server mode)
-     * @return New connection socket FD or -1 on error
-     */
-    someip_socket_t accept_connection();
-
-    /**
      * @brief Parse one complete SOME/IP message from a byte buffer.
      *
      * Consumes exactly the bytes of one message if successful; leaves
@@ -346,6 +354,9 @@ private:
     std::atomic<ITransportListener*> listener_{nullptr};
 
     std::atomic<bool> running_{false};
+    /// Set for the duration of an outbound connect() handshake so
+    /// get_connection_state() can report CONNECTING (REQ_TRANSPORT_003a).
+    std::atomic<bool> outbound_connecting_{false};
     std::optional<platform::Thread> receive_thread_;
     std::optional<platform::Thread> connection_thread_;
 
@@ -375,7 +386,11 @@ private:
     someip_socket_t listen_socket_fd_{SOMEIP_INVALID_SOCKET};
 
     void deliver_or_enqueue(const MessagePtr& message, const Endpoint& sender);
+    /// Accept is private: receive_loop() always accepts, and a public caller
+    /// would steal clients that never enter the slot table.
+    someip_socket_t accept_connection();
     someip_socket_t accept_connection_with_peer(Endpoint& peer_endpoint);
+    void close_listen_and_bound_sockets();
     Result create_socket();
     Result bind_socket();
     Result setup_socket_options(someip_socket_t socket_fd, bool blocking = true);

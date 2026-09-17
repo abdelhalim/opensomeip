@@ -163,6 +163,9 @@
 - `UdpTransport::receive_message_with_sender(Endpoint& sender)` — polling
   mode variant that also returns the sender's endpoint for reply
   addressing without requiring a listener.
+- `TcpTransport::receive_message_with_sender(Endpoint& sender)` — the same
+  polling helper on TCP, so a multi-peer server can reply without a
+  listener (#319).
 - `RpcClient::send_request_no_return()` — fire-and-forget `REQUEST_NO_RETURN`
   (message type 0x01) with no pending-call wait (#308).
 - `RpcServer::register_method(..., MethodSemantics)` — request/response vs
@@ -177,10 +180,13 @@
 
 - `SOMEIP_MAX_TCP_CONNECTIONS` (default 10, matching the long-standing
   `TcpTransportConfig::max_connections` default) sizes the TCP connection
-  table at compile time. The configured limit is clamped to it and
-  reported by `max_connections()`. Raising it on a static-allocation
-  build usually means raising the `SOMEIP_BYTE_POOL_*` counts too, since
-  each served connection may hold a pooled receive buffer.
+  table at compile time. It is defined in `static_config.h` and forwarded
+  from CMake like the other static-alloc knobs, so
+  `-DSOMEIP_MAX_TCP_CONNECTIONS` reaches the compiler. The configured
+  limit is clamped to it and reported by `max_connections()`. Raising it
+  on a static-allocation build usually means raising the
+  `SOMEIP_BYTE_POOL_*` counts too, since each served connection may hold
+  a pooled receive buffer.
 
 ### Bug Fixes
 
@@ -233,9 +239,10 @@
   unbounded retry could hold a connection's I/O lock indefinitely against
   a peer that stopped reading, which in turn made `disconnect_peer()`,
   `stop()` and the destructor block forever.
-- **TCP**: `get_connection_state()` reports `DISCONNECTING` while a peer
-  is being torn down; previously only `CONNECTED` and `DISCONNECTED` were
-  ever returned.
+- **TCP**: `get_connection_state()` reports `CONNECTING` while an outbound
+  `connect()` handshake is in progress, then `CONNECTED` or
+  `DISCONNECTED` (`REQ_TRANSPORT_003a`). `DISCONNECTING` is still
+  reported while a peer is being torn down.
 - **TCP**: a peer that reconnects from the same source port now replaces
   its own stale connection. The accept path retires a still-ACTIVE entry
   for that endpoint before allocating, so the table no longer holds two

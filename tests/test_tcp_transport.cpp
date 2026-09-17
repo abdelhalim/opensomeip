@@ -324,6 +324,44 @@ TEST_F(TcpTransportTest, ConnectionStateManagement) {
     transport.stop();
 }
 
+/**
+ * @test_case TC_TCP_CONNECT_REPORTS_CONNECTING
+ * @tests REQ_TRANSPORT_003a
+ * @brief get_connection_state() reports CONNECTING during an outbound handshake
+ */
+TEST_F(TcpTransportTest, ConnectReportsConnectingDuringHandshake) {
+    TcpTransportConfig slow;
+    slow.connection_timeout = std::chrono::milliseconds(500);
+    slow.receive_timeout = std::chrono::milliseconds(50);
+    slow.send_timeout = std::chrono::milliseconds(50);
+    slow.max_receive_buffer = 4096;
+
+    TcpTransport client(slow);
+    ASSERT_EQ(client.initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
+
+    std::atomic<bool> saw_connecting{false};
+    std::atomic<Result> connect_result{Result::SUCCESS};
+    std::thread connector([&]() {
+        connect_result.store(
+            client.connect(Endpoint("192.0.2.1", 9, TransportProtocol::TCP)),
+            std::memory_order_release);
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (client.get_connection_state() == TcpConnectionState::CONNECTING) {
+            saw_connecting.store(true, std::memory_order_release);
+            break;
+        }
+    }
+    connector.join();
+
+    EXPECT_NE(connect_result.load(std::memory_order_acquire), Result::SUCCESS);
+    EXPECT_TRUE(saw_connecting.load(std::memory_order_acquire))
+        << "REQ_TRANSPORT_003a requires CONNECTING during handshake";
+    EXPECT_EQ(client.get_connection_state(), TcpConnectionState::DISCONNECTED);
+}
+
 TEST_F(TcpTransportTest, EndpointValidation) {
     TcpTransport transport(config);
 
@@ -334,6 +372,7 @@ TEST_F(TcpTransportTest, EndpointValidation) {
 
     Endpoint returned = transport.get_local_endpoint();
     ASSERT_EQ(returned.get_address(), valid_endpoint.get_address());
+    ASSERT_EQ(returned.get_protocol(), TransportProtocol::TCP);
 
     transport.stop();
 }
@@ -996,14 +1035,16 @@ TEST_F(TcpTransportTest, ModeSwitchPollingToListenerAndBack) {
     }
 
     MessagePtr polled;
+    Endpoint polled_sender;
     const auto deadline1 = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
     while (std::chrono::steady_clock::now() < deadline1) {
-        polled = server.receive_message();
+        polled = server.receive_message_with_sender(polled_sender);
         if (polled) { break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     ASSERT_NE(polled, nullptr) << "Phase 1: polling must receive the message";
     EXPECT_EQ(polled->get_service_id(), 0x1111);
+    EXPECT_EQ(polled_sender, client.get_local_endpoint());
 
     // --- Phase 2: install listener → messages go to listener only ---
     TestTcpListener server_listener;
@@ -1545,7 +1586,8 @@ TEST_F(TcpTransportTest, StalledPeerDoesNotBlockOtherPeers) {
 
     const auto probe_start = std::chrono::steady_clock::now();
     const size_t count = server.connection_count();
-    const bool healthy_up = server.is_peer_connected(healthy.transport->get_local_endpoint());
+    const Endpoint healthy_ep = healthy.transport->get_local_endpoint();
+    const bool healthy_up = server.is_peer_connected(healthy_ep);
     const auto probe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - probe_start);
 
@@ -1554,6 +1596,18 @@ TEST_F(TcpTransportTest, StalledPeerDoesNotBlockOtherPeers) {
     EXPECT_LT(probe_ms.count(), 1000)
         << "connection table queries waited " << probe_ms.count()
         << "ms behind a send blocked on an unresponsive peer";
+
+    healthy.listener->clear_messages();
+    const auto send_start = std::chrono::steady_clock::now();
+    EXPECT_EQ(server.send_message(make_tagged_message(0x11), healthy_ep), Result::SUCCESS)
+        << "a blocked peer must not stall sends to a healthy one";
+    const auto send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - send_start);
+    EXPECT_LT(send_ms.count(), 1000)
+        << "send to the healthy peer waited " << send_ms.count()
+        << "ms behind a send blocked on an unresponsive peer";
+    EXPECT_TRUE(healthy.listener->wait_for_messages(1, std::chrono::milliseconds(2000)))
+        << "the healthy peer must actually receive traffic while the other is stalled";
 
     // Let the stalled peer start draining so the in-flight send can complete.
     // Closing it here instead would complete that send with EPIPE, and the send
@@ -1663,8 +1717,8 @@ TEST_F(TcpTransportTest, SendToUnknownPeerDoesNotMisroute) {
     }
     ASSERT_EQ(server.connection_count(), 1U);
 
-    // A well-formed endpoint that is not one of the server's peers.
-    const Endpoint stranger("127.0.0.1", 1);
+    // A well-formed TCP endpoint that is not one of the server's peers.
+    const Endpoint stranger("127.0.0.1", 1, TransportProtocol::TCP);
     EXPECT_FALSE(server.is_peer_connected(stranger));
     EXPECT_EQ(server.send_message(make_tagged_message(0), stranger), Result::NOT_CONNECTED)
         << "an unknown peer must not fall back to another connection";

@@ -40,11 +40,25 @@ namespace someip::transport {
 
 namespace {
 
-/// Endpoint::operator== also compares the protocol, but get_local_endpoint()
-/// reports no protocol, so peers are identified by address and port alone.
+/// Peers are identified by address, port, and protocol. get_local_endpoint()
+/// reports TransportProtocol::TCP after bind, matching accept() and connect().
 bool same_peer(const Endpoint& lhs, const Endpoint& rhs) {
-    return lhs.get_port() == rhs.get_port() && lhs.get_address() == rhs.get_address();
+    return lhs == rhs;
 }
+
+class OutboundConnectingGuard {
+public:
+    explicit OutboundConnectingGuard(std::atomic<bool>& flag) : flag_(flag) {
+        flag_.store(true, std::memory_order_release);
+    }
+    ~OutboundConnectingGuard() { flag_.store(false, std::memory_order_release); }
+
+    OutboundConnectingGuard(const OutboundConnectingGuard&) = delete;
+    OutboundConnectingGuard& operator=(const OutboundConnectingGuard&) = delete;
+
+private:
+    std::atomic<bool>& flag_;
+};
 
 }  // namespace
 
@@ -66,16 +80,7 @@ TcpTransport::~TcpTransport() {
     // opened by initialize()/connect()/enable_server_mode() is released here.
     listener_.store(nullptr, std::memory_order_release);
     disconnect_internal();
-
-    platform::ScopedLock const lock(table_mutex_);
-    if (listen_socket_fd_ != SOMEIP_INVALID_SOCKET) {
-        someip_close_socket(listen_socket_fd_);
-        listen_socket_fd_ = SOMEIP_INVALID_SOCKET;
-    }
-    if (bound_socket_fd_ != SOMEIP_INVALID_SOCKET) {
-        someip_close_socket(bound_socket_fd_);
-        bound_socket_fd_ = SOMEIP_INVALID_SOCKET;
-    }
+    close_listen_and_bound_sockets();
 }
 
 Result TcpTransport::initialize(const Endpoint& local_endpoint) {
@@ -99,7 +104,8 @@ Result TcpTransport::initialize(const Endpoint& local_endpoint) {
     socklen_t addr_len = sizeof(bound_addr);
     if (someip_getsockname(bound_socket_fd_,
                            reinterpret_cast<struct sockaddr*>(&bound_addr), &addr_len) == 0) {
-        local_endpoint_ = Endpoint(local_endpoint_.get_address(), ntohs(bound_addr.sin_port));
+        local_endpoint_ = Endpoint(local_endpoint_.get_address(), ntohs(bound_addr.sin_port),
+                                   TransportProtocol::TCP);
     }
 
     return Result::SUCCESS;
@@ -141,13 +147,19 @@ Result TcpTransport::send_message(const Message& message, const Endpoint& endpoi
 }
 
 MessagePtr TcpTransport::receive_message() {
+    Endpoint unused;
+    return receive_message_with_sender(unused);
+}
+
+MessagePtr TcpTransport::receive_message_with_sender(Endpoint& sender) {
     platform::ScopedLock const lock(queue_mutex_);
     if (message_queue_.empty()) {
         return nullptr;
     }
 
-    auto [message, sender] = message_queue_.front();
+    auto [message, origin] = message_queue_.front();
     message_queue_.pop();
+    sender = origin;
     return message;
 }
 
@@ -438,23 +450,7 @@ Result TcpTransport::stop() {
 
     // Close connections
     disconnect_internal();
-
-    {
-        platform::ScopedLock const lock(table_mutex_);
-
-        // The listen socket is owned separately from every peer connection, so
-        // closing it here cannot double-close a descriptor already released above.
-        if (listen_socket_fd_ != SOMEIP_INVALID_SOCKET) {
-            someip_close_socket(listen_socket_fd_);
-            listen_socket_fd_ = SOMEIP_INVALID_SOCKET;
-        }
-
-        // Bound but never promoted to a listener or a connection.
-        if (bound_socket_fd_ != SOMEIP_INVALID_SOCKET) {
-            someip_close_socket(bound_socket_fd_);
-            bound_socket_fd_ = SOMEIP_INVALID_SOCKET;
-        }
-    }
+    close_listen_and_bound_sockets();
 
     // Wait for threads to finish
     if (receive_thread_ && receive_thread_->joinable()) {
@@ -467,12 +463,33 @@ Result TcpTransport::stop() {
     return Result::SUCCESS;
 }
 
+void TcpTransport::close_listen_and_bound_sockets() {
+    someip_socket_t listen_fd = SOMEIP_INVALID_SOCKET;
+    someip_socket_t bound_fd = SOMEIP_INVALID_SOCKET;
+    {
+        platform::ScopedLock const lock(table_mutex_);
+        listen_fd = listen_socket_fd_;
+        listen_socket_fd_ = SOMEIP_INVALID_SOCKET;
+        bound_fd = bound_socket_fd_;
+        bound_socket_fd_ = SOMEIP_INVALID_SOCKET;
+    }
+
+    // close() is a blocking syscall; do not hold table_mutex_ across it.
+    if (listen_fd != SOMEIP_INVALID_SOCKET) {
+        someip_close_socket(listen_fd);
+    }
+    if (bound_fd != SOMEIP_INVALID_SOCKET) {
+        someip_close_socket(bound_fd);
+    }
+}
+
 bool TcpTransport::is_running() const {
     return running_;
 }
 
 /** @implements REQ_TRANSPORT_003a */
 TcpConnectionState TcpTransport::get_connection_state() const {
+    const bool connecting = outbound_connecting_.load(std::memory_order_acquire);
     platform::ScopedLock const lock(table_mutex_);
     bool closing = false;
     for (const auto& slot : slots_) {
@@ -480,6 +497,9 @@ TcpConnectionState TcpTransport::get_connection_state() const {
             return TcpConnectionState::CONNECTED;  // One usable peer is enough.
         }
         closing = closing || (slot.state == SlotState::CLOSING);
+    }
+    if (connecting) {
+        return TcpConnectionState::CONNECTING;
     }
     return closing ? TcpConnectionState::DISCONNECTING : TcpConnectionState::DISCONNECTED;
 }
@@ -636,6 +656,8 @@ Result TcpTransport::connect_internal(const Endpoint& endpoint) {
         return Result::NOT_INITIALIZED;
     }
 
+    const OutboundConnectingGuard connecting(outbound_connecting_);
+
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(endpoint.get_port());
@@ -696,7 +718,8 @@ Result TcpTransport::connect_internal(const Endpoint& endpoint) {
         }
 
         slot->conn.socket_fd = socket_fd;
-        slot->conn.remote_endpoint = endpoint;
+        slot->conn.remote_endpoint =
+            Endpoint(endpoint.get_address(), endpoint.get_port(), TransportProtocol::TCP);
         slot->conn.state = TcpConnectionState::CONNECTED;
         slot->conn.receive_buffer.clear();
         slot->conn.update_activity();
