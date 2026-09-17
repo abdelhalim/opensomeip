@@ -2218,10 +2218,8 @@ TEST_F(TcpTransportTest, ClientSendToStalledPeerWaitsWithoutSpinning) {
 
     TcpTransport client(slow);
     ASSERT_EQ(client.initialize(Endpoint("127.0.0.1", 0)), Result::SUCCESS);
-
-    TestTcpListener client_listener;
-    client.set_listener(&client_listener);
-    ASSERT_EQ(client.start(), Result::SUCCESS);
+    // Do not start() the receive loop: std::clock() is process-wide (notably on
+    // Windows), so a second thread would charge CPU against this measurement.
     ASSERT_EQ(client.connect(stalled_server_ep), Result::SUCCESS);
 
     someip_socket_t const accepted_fd = someip_accept(listen_fd, nullptr, nullptr);
@@ -2261,5 +2259,4 @@ TEST_F(TcpTransportTest, ClientSendToStalledPeerWaitsWithoutSpinning) {
     someip_close_socket(accepted_fd);
     someip_close_socket(listen_fd);
     client.disconnect();
-    client.stop();
 }
