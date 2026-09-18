@@ -35,6 +35,14 @@
   includes the selected PAL backend include dirs and
   `opensomeipConfig.cmake` calls `find_dependency(Threads)`.
 
+### Documentation
+
+- **Traceability**: Regenerated `docs/specification/spec-mapping-report.md` so
+  `feat_req_someipsd_818` maps to `REQ_SD_818` (unicast Subscribe family) instead
+  of shutdown `REQ_SD_310`. CAPI, PAL, and `REQ_TP_081_ATOM` are classified as
+  implementation-derived and no longer listed as missing Open SOME/IP links
+  ([#309](https://github.com/vtz/opensomeip/issues/309)).
+
 ### Bug Fixes
 
 - **SOME/IP-SD**: SubscribeEventgroup family is unicast-only. Clients send
