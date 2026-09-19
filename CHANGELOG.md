@@ -15,7 +15,54 @@
 
 ## Unreleased
 
+### CI / Infrastructure
+
+- **Coverity Scan**: Re-enable the weekly Monday 04:00 UTC schedule and
+  `push` to `main` now that scan.coverity.com is serving the project again
+  ([#265](https://github.com/vtz/opensomeip/issues/265)). `workflow_dispatch`
+  remains for a manual verification run.
+- Fork PRs no longer fail the RPM workflow template on empty Docker Hub
+  secrets; Fedora images are pulled anonymously
+  ([#330](https://github.com/vtz/opensomeip/issues/330)). The Python
+  detailed check-run step already skips forks (landed in #325).
+
+### Documentation
+
+- **CMake**: `find_package(opensomeip)` / `opensomeip::opensomeip` documented
+  as the installed package; the old `SomeIP::someip-common` snippet was wrong
+  ([#271](https://github.com/vtz/opensomeip/issues/271)). Host CI installs the
+  package and builds `tests/cmake_package` against it. The exported target now
+  includes the selected PAL backend include dirs and
+  `opensomeipConfig.cmake` calls `find_dependency(Threads)`.
+
+### Documentation
+
+- **Traceability**: Regenerated `docs/specification/spec-mapping-report.md` so
+  `feat_req_someipsd_818` maps to `REQ_SD_818` (unicast Subscribe family) instead
+  of shutdown `REQ_SD_310`. CAPI, PAL, and `REQ_TP_081_ATOM` are classified as
+  implementation-derived and no longer listed as missing Open SOME/IP links
+  ([#309](https://github.com/vtz/opensomeip/issues/309)).
+
+### Added
+
+- **Message**: `try_deserialize()` returns a structured `someip::Result` for
+  each semantic rejection class. Existing `deserialize()` overloads remain
+  source-compatible bool wrappers
+  ([#316](https://github.com/vtz/opensomeip/issues/316)).
+
 ### Bug Fixes
+
+- **SOME/IP-SD**: SubscribeEventgroup with both a UDP and a TCP
+  IPv4EndpointOption is accepted; only true duplicates (two UDP or two
+  TCP) are NACKed
+  ([#321](https://github.com/vtz/opensomeip/issues/321)).
+- **SOME/IP-SD**: SubscribeEventgroupAck/Nack are sent to the SD datagram
+  sender, not the event IPv4EndpointOption address
+  ([#322](https://github.com/vtz/opensomeip/issues/322)).
+- **SOME/IP-SD**: IPv6 Endpoint (Type 0x06) and IPv6 Multicast (Type 0x16)
+  options are parsed instead of being skipped as unknown. IPv6 SD Endpoint
+  (0x26) and ``AF_INET6`` transport remain out of scope
+  ([#320](https://github.com/vtz/opensomeip/issues/320)).
 
 - **SOME/IP-SD**: SubscribeEventgroup family is unicast-only. Clients send
   Subscribe/StopSubscribe to the Offer datagram source (not the SD multicast
