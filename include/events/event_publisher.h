@@ -17,6 +17,7 @@
 #include "event_types.h"
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
+#include "transport/transport.h"
 
 #ifdef SOMEIP_STATIC_ALLOC
 #include "static_config.h"
@@ -47,6 +48,13 @@ public:
     EventPublisher(uint16_t service_id, uint16_t instance_id);
 
     /**
+     * @brief Borrow an exclusive, stopped transport instead of creating UDP.
+     * @param transport Must outlive this publisher; the publisher manages start/stop.
+     * @see transport::ITransport for the injected-transport lifecycle contract.
+     */
+    EventPublisher(uint16_t service_id, uint16_t instance_id, transport::ITransport& transport);
+
+    /**
      * @brief Destructor
      */
     ~EventPublisher();
@@ -67,6 +75,11 @@ public:
      * @brief Shutdown the event publisher
      */
     void shutdown();
+
+    /**
+     * @brief Result of the last transport start/stop (including failed-start cleanup).
+     */
+    Result get_transport_result() const;
 
     /**
      * @brief Register an event for publication
