@@ -43,6 +43,13 @@
   implementation-derived and no longer listed as missing Open SOME/IP links
   ([#309](https://github.com/vtz/opensomeip/issues/309)).
 
+### Added
+
+- **Message**: `try_deserialize()` returns a structured `someip::Result` for
+  each semantic rejection class. Existing `deserialize()` overloads remain
+  source-compatible bool wrappers
+  ([#316](https://github.com/vtz/opensomeip/issues/316)).
+
 ### Bug Fixes
 
 - **SOME/IP-SD**: SubscribeEventgroup family is unicast-only. Clients send
