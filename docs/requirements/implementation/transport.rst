@@ -603,13 +603,15 @@ Magic Cookie Details
    :status: implemented
    :priority: medium
    :category: error_path
-   :verification: Unit test: Join multicast group on interface with no multicast support, verify error is returned.
+   :verification: Unit test: Join a multicast group with the interface set to a TEST-NET-1 address (RFC 5737) so IP_ADD_MEMBERSHIP fails independently of host multicast support, verify MULTICAST_ERROR is returned and the group and interface are retrievable.
 
    The software shall return an error when multicast group join fails.
 
    **Rationale**: Failed multicast joins prevent SD and event reception.
 
-   **Error Handling**: Return MULTICAST_ERROR and log group address and interface.
+   **Error Handling**: Return MULTICAST_ERROR and record group address and
+   interface. The project has no logging facility, so the context is exposed
+   through ``UdpTransport::last_multicast_error()`` rather than written to a log.
 
    **Code Location**: ``src/transport/udp_transport.cpp``
 
