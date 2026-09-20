@@ -96,9 +96,17 @@ public:
             return false;
         }
 
-        // Join multicast group for SD messages
-        if (!join_multicast_group()) {
-            // Continue without multicast support in constrained environments
+        // Join multicast group for SD messages. A failure is not fatal here —
+        // the server still answers unicast SD — but it must be visible rather
+        // than reported as a normal start, and it is re-attempted by the offer
+        // timer. Constrained environments therefore run in an explicitly
+        // degraded state instead of an apparently healthy one.
+        if (join_multicast_group()) {
+            multicast_state_ = MulticastState::Joined;
+        } else {
+            multicast_attempts_ = 0;
+            multicast_state_ = (config_.multicast_rejoin_max_attempts > 0) ? MulticastState::Retrying
+                                                                          : MulticastState::Exhausted;
         }
 
         running_ = true;
@@ -107,6 +115,14 @@ public:
         start_offer_timer();
 
         return true;
+    }
+
+    /**
+     * @brief Local SD multicast membership state
+     * @implements REQ_TRANSPORT_011_E01
+     */
+    MulticastState multicast_state() const {
+        return multicast_state_.load();
     }
 
     /** @implements REQ_SD_090, REQ_SD_091, REQ_SD_092, REQ_SD_093, REQ_SD_094 */
@@ -356,6 +372,24 @@ private:
         return transport_.join_multicast_group(config_.multicast_address) == Result::SUCCESS;
     }
 
+    /** @implements REQ_TRANSPORT_011_E03 */
+    void retry_multicast_join_if_pending() {
+        if (multicast_state_.load() != MulticastState::Retrying) {
+            return;
+        }
+
+        if (join_multicast_group()) {
+            multicast_attempts_ = 0;
+            multicast_state_ = MulticastState::Joined;
+            return;
+        }
+
+        ++multicast_attempts_;
+        if (multicast_attempts_ >= config_.multicast_rejoin_max_attempts) {
+            multicast_state_ = MulticastState::Exhausted;
+        }
+    }
+
     void leave_multicast_group() {
         transport_.leave_multicast_group(config_.multicast_address);
     }
@@ -368,6 +402,8 @@ private:
 
         offer_timer_thread_.emplace([this]() {
             while (running_) {
+                retry_multicast_join_if_pending();
+
                 const auto sleep_time = send_due_offers();
 
                 if (!running_) {
@@ -907,6 +943,8 @@ private:
     mutable platform::Mutex offered_services_mutex_;
 
     std::optional<platform::Thread> offer_timer_thread_;
+    std::atomic<MulticastState> multicast_state_{MulticastState::Joined};
+    uint8_t multicast_attempts_{0};  // Only touched by initialize() and the offer timer thread.
     std::atomic<bool> running_;
 
     SdSessionIdCounter multicast_session_id_;
@@ -1006,6 +1044,10 @@ platform::Vector<ServiceInstance> SdServer::get_offered_services() const {
 
 bool SdServer::is_ready() const {
     return impl()->is_ready();
+}
+
+MulticastState SdServer::multicast_state() const {
+    return impl()->multicast_state();
 }
 
 SdServer::Statistics SdServer::get_statistics() const {

@@ -103,6 +103,22 @@ struct SdConfig {
     /// When true, pick_initial_wait_ms() returns initial_delay_override_ms exactly.
     bool has_initial_delay_override{false};
     uint32_t initial_delay_override_ms{0};
+    /// Bounded re-attempts after a failed multicast join (0 disables re-attempt).
+    /// REQ_TRANSPORT_016_E01 establishes the same bounded shape for TCP reconnect.
+    uint8_t multicast_rejoin_max_attempts{5};
+};
+
+/**
+ * @brief Local multicast membership state
+ *
+ * Distinct from remote subscription acceptance: a peer may have acknowledged a
+ * SubscribeEventgroup while the local membership needed to receive those events
+ * has failed. The two facts must not be conflated.
+ */
+enum class MulticastState : uint8_t {
+    Joined,    ///< Membership is active
+    Retrying,  ///< Join failed; bounded re-attempts are in progress
+    Exhausted  ///< Re-attempts exhausted; multicast reception is unavailable
 };
 
 /**

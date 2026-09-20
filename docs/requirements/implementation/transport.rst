@@ -615,6 +615,29 @@ Magic Cookie Details
 
    **Code Location**: ``src/transport/udp_transport.cpp``
 
+.. requirement:: Error - Multicast Join Recovery
+   :id: REQ_TRANSPORT_011_E03
+   :status: implemented
+   :priority: medium
+   :category: error_path
+   :verification: Unit test: Configure an unjoinable group with multicast_rejoin_max_attempts=1, verify the membership is re-attempted and the state becomes Exhausted rather than retried indefinitely. Verify a transient failure followed by success reaches the joined state without caller intervention.
+
+   The software shall re-attempt a failed multicast group join a bounded number
+   of times and report exhaustion.
+
+   **Rationale**: Reporting a join failure without any means of recovery leaves
+   the caller holding an error it cannot act on: the membership is owned by the
+   transport and no API re-attempts it. A transient condition such as an
+   interface that is not yet up when the socket is configured would otherwise
+   remain failed for the lifetime of the process. REQ_TRANSPORT_002_E01 already
+   pairs error reporting with scheduled recovery for the analogous TCP failure,
+   and REQ_TRANSPORT_016_E01 bounds that recovery.
+
+   **Error Handling**: Re-attempt from the existing SD periodic work up to
+   ``SdConfig::multicast_rejoin_max_attempts``, then report ``Exhausted``.
+
+   **Code Location**: ``src/sd/sd_server.cpp``, ``src/sd/sd_client.cpp``
+
 .. requirement:: Error - Port Already In Use
    :id: REQ_TRANSPORT_014_E01
    :status: implemented
