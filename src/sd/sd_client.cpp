@@ -93,6 +93,11 @@ public:
             return false;
         }
 
+        // Deliberately fail closed here, unlike SdServer. A client that cannot
+        // receive SD multicast cannot discover anything, and initialize()
+        // returning false is already an explicit, caller-visible failure that
+        // can be retried. Re-attempt is reserved for the paths where the
+        // failure would otherwise be invisible.
         if (!join_multicast_group()) {
             transport_.stop();
             return false;
@@ -114,10 +119,14 @@ public:
      */
     MulticastState eventgroup_multicast_state() const {
         platform::ScopedLock const lock(pending_multicast_mutex_);
-        if (!pending_multicast_joins_.empty()) {
-            return MulticastState::Retrying;
+        bool any_exhausted = false;
+        for (const auto& pending : pending_multicast_joins_) {
+            if (!pending.exhausted) {
+                return MulticastState::RETRYING;
+            }
+            any_exhausted = true;
         }
-        return multicast_exhausted_ ? MulticastState::Exhausted : MulticastState::Joined;
+        return any_exhausted ? MulticastState::EXHAUSTED : MulticastState::JOINED;
     }
 
     void shutdown() {
@@ -126,6 +135,8 @@ public:
         }
 
         running_ = false;
+
+        clear_multicast_tracking();
 
         stop_maintenance_loop();
 
@@ -512,16 +523,16 @@ private:
 
     void record_pending_multicast_join(const platform::String<>& group) {
         platform::ScopedLock const lock(pending_multicast_mutex_);
-        if (config_.multicast_rejoin_max_attempts == 0) {
-            multicast_exhausted_ = true;
-            return;
-        }
-        for (const auto& pending : pending_multicast_joins_) {
+        for (auto& pending : pending_multicast_joins_) {
             if (pending.group == group) {
                 return;
             }
         }
-        pending_multicast_joins_.push_back(PendingMulticastJoin{group, 0});
+        PendingMulticastJoin entry;
+        entry.group = group;
+        entry.exhausted = (config_.multicast_rejoin_max_attempts == 0);
+        entry.next_attempt = std::chrono::steady_clock::now() + config_.multicast_rejoin_interval;
+        pending_multicast_joins_.push_back(entry);
     }
 
     void clear_pending_multicast_join(const platform::String<>& group) {
@@ -534,25 +545,34 @@ private:
         }
     }
 
+    void clear_multicast_tracking() {
+        platform::ScopedLock const lock(pending_multicast_mutex_);
+        pending_multicast_joins_.clear();
+    }
+
     /** @implements REQ_TRANSPORT_011_E03 */
     void retry_pending_multicast_joins() {
         platform::ScopedLock const lock(pending_multicast_mutex_);
+        const auto now = std::chrono::steady_clock::now();
         for (auto it = pending_multicast_joins_.begin(); it != pending_multicast_joins_.end();) {
+            // The maintenance loop ticks every 20ms, far faster than a link comes
+            // up, so attempts are spaced by wall clock rather than by tick.
+            if (it->exhausted || now < it->next_attempt) {
+                ++it;
+                continue;
+            }
+
             if (transport_.join_multicast_group(it->group) == Result::SUCCESS) {
                 it = pending_multicast_joins_.erase(it);
                 continue;
             }
 
             ++it->attempts;
-            if (it->attempts >= config_.multicast_rejoin_max_attempts) {
-                multicast_exhausted_ = true;
-                it = pending_multicast_joins_.erase(it);
-            } else {
-                ++it;
-            }
+            it->next_attempt = now + config_.multicast_rejoin_interval;
+            it->exhausted = (it->attempts >= config_.multicast_rejoin_max_attempts);
+            ++it;
         }
     }
-
 
     void leave_multicast_group() {
         transport_.leave_multicast_group(config_.multicast_address);
@@ -781,9 +801,12 @@ private:
     struct PendingMulticastJoin {
         platform::String<> group;
         uint8_t attempts{0};
+        bool exhausted{false};
+        std::chrono::steady_clock::time_point next_attempt;
     };
+    // Exhausted entries are retained rather than erased so the aggregate state
+    // stays accurate, and so a later successful join for the same group clears it.
     platform::Vector<PendingMulticastJoin> pending_multicast_joins_;
-    bool multicast_exhausted_{false};
 
     platform::UnorderedMap<uint64_t, CachedService, 32> cached_services_;
     platform::UnorderedMap<uint64_t, EventGroupSubscription, 32> eventgroup_subscriptions_;

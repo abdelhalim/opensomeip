@@ -620,7 +620,7 @@ Magic Cookie Details
    :status: implemented
    :priority: medium
    :category: error_path
-   :verification: Unit test: Configure an unjoinable group with multicast_rejoin_max_attempts=1, verify the membership is re-attempted and the state becomes Exhausted rather than retried indefinitely. Verify a transient failure followed by success reaches the joined state without caller intervention.
+   :verification: Unit test: Configure a TEST-NET-1 multicast interface so IP_ADD_MEMBERSHIP always fails, set multicast_rejoin_max_attempts=1, and verify the membership is re-attempted on the existing SD periodic loop and then reports Exhausted rather than being retried indefinitely. Verify a zero bound disables re-attempt. Recovery to the joined state after a transient failure needs a transport that can be made to fail once and then succeed, so it is not covered until transport injection is available.
 
    The software shall re-attempt a failed multicast group join a bounded number
    of times and report exhaustion.

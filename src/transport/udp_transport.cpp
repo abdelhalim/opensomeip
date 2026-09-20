@@ -415,6 +415,8 @@ Result UdpTransport::configure_multicast(const Endpoint& endpoint) {
         return Result::INVALID_ENDPOINT;
     }
 
+    platform::ScopedLock const lock(socket_mutex_);
+
     struct ip_mreq mreq = {};
     mreq.imr_multiaddr.s_addr = someip_inet_addr(endpoint.get_address().c_str());
 

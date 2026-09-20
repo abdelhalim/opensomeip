@@ -101,12 +101,13 @@ public:
         // than reported as a normal start, and it is re-attempted by the offer
         // timer. Constrained environments therefore run in an explicitly
         // degraded state instead of an apparently healthy one.
+        multicast_attempts_ = 0;
         if (join_multicast_group()) {
-            multicast_state_ = MulticastState::Joined;
+            multicast_state_ = MulticastState::JOINED;
         } else {
-            multicast_attempts_ = 0;
-            multicast_state_ = (config_.multicast_rejoin_max_attempts > 0) ? MulticastState::Retrying
-                                                                          : MulticastState::Exhausted;
+            next_multicast_attempt_ = std::chrono::steady_clock::now() + config_.multicast_rejoin_interval;
+            multicast_state_ = (config_.multicast_rejoin_max_attempts > 0) ? MulticastState::RETRYING
+                                                                          : MulticastState::EXHAUSTED;
         }
 
         running_ = true;
@@ -374,19 +375,27 @@ private:
 
     /** @implements REQ_TRANSPORT_011_E03 */
     void retry_multicast_join_if_pending() {
-        if (multicast_state_.load() != MulticastState::Retrying) {
+        if (multicast_state_.load() != MulticastState::RETRYING) {
             return;
         }
 
+        // The offer timer ticks on the offer schedule, which is unrelated to how
+        // long a link takes to come up, so attempts are spaced by wall clock.
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_multicast_attempt_) {
+            return;
+        }
+        next_multicast_attempt_ = now + config_.multicast_rejoin_interval;
+
         if (join_multicast_group()) {
             multicast_attempts_ = 0;
-            multicast_state_ = MulticastState::Joined;
+            multicast_state_ = MulticastState::JOINED;
             return;
         }
 
         ++multicast_attempts_;
         if (multicast_attempts_ >= config_.multicast_rejoin_max_attempts) {
-            multicast_state_ = MulticastState::Exhausted;
+            multicast_state_ = MulticastState::EXHAUSTED;
         }
     }
 
@@ -943,8 +952,12 @@ private:
     mutable platform::Mutex offered_services_mutex_;
 
     std::optional<platform::Thread> offer_timer_thread_;
-    std::atomic<MulticastState> multicast_state_{MulticastState::Joined};
-    uint8_t multicast_attempts_{0};  // Only touched by initialize() and the offer timer thread.
+    std::atomic<MulticastState> multicast_state_{MulticastState::JOINED};
+    // Both are written by initialize() and by the offer timer thread, which do not
+    // overlap: initialize() starts the timer only after setting them, and
+    // shutdown() joins the timer before a later initialize() can run.
+    uint8_t multicast_attempts_{0};
+    std::chrono::steady_clock::time_point next_multicast_attempt_;
     std::atomic<bool> running_;
 
     SdSessionIdCounter multicast_session_id_;

@@ -1225,7 +1225,7 @@ TEST_F(SdTest, ServerReportsJoinedOnSuccessfulMulticastJoin) {
     auto server = std::make_shared<SdServer>(config);
 
     ASSERT_TRUE(server->initialize());
-    EXPECT_EQ(server->multicast_state(), MulticastState::Joined);
+    EXPECT_EQ(server->multicast_state(), MulticastState::JOINED);
 
     server->shutdown();
 }
@@ -1240,11 +1240,14 @@ TEST_F(SdTest, ServerReportsJoinedOnSuccessfulMulticastJoin) {
  */
 TEST_F(SdTest, ServerReportsDegradedStateWhenMulticastJoinFails) {
     SdConfig config;
-    config.multicast_address = "10.0.0.1";  // Not a multicast group: the join fails.
+    // make_sd_transport_config() maps unicast_address to the multicast interface.
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) and is never locally assigned, so the
+    // group stays valid and IP_ADD_MEMBERSHIP itself fails.
+    config.unicast_address = "192.0.2.1";
     auto server = std::make_shared<SdServer>(config);
 
     ASSERT_TRUE(server->initialize());
-    EXPECT_EQ(server->multicast_state(), MulticastState::Retrying);
+    EXPECT_EQ(server->multicast_state(), MulticastState::RETRYING);
 
     server->shutdown();
 }
@@ -1256,17 +1259,18 @@ TEST_F(SdTest, ServerReportsDegradedStateWhenMulticastJoinFails) {
  */
 TEST_F(SdTest, ServerMulticastRejoinIsBoundedAndReportsExhaustion) {
     SdConfig config;
-    config.multicast_address = "10.0.0.1";  // Permanently unjoinable.
+    config.unicast_address = "192.0.2.1";  // Interface never present: join always fails.
     config.multicast_rejoin_max_attempts = 1;
+    config.multicast_rejoin_interval = std::chrono::milliseconds(10);
     auto server = std::make_shared<SdServer>(config);
 
     ASSERT_TRUE(server->initialize());
 
     // The offer timer drives the re-attempt, so poll rather than assume a tick rate.
-    for (int i = 0; i < 40 && server->multicast_state() != MulticastState::Exhausted; ++i) {
+    for (int i = 0; i < 40 && server->multicast_state() != MulticastState::EXHAUSTED; ++i) {
         platform::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    EXPECT_EQ(server->multicast_state(), MulticastState::Exhausted);
+    EXPECT_EQ(server->multicast_state(), MulticastState::EXHAUSTED);
 
     server->shutdown();
 }
@@ -1278,12 +1282,12 @@ TEST_F(SdTest, ServerMulticastRejoinIsBoundedAndReportsExhaustion) {
  */
 TEST_F(SdTest, ServerMulticastRejoinCanBeDisabled) {
     SdConfig config;
-    config.multicast_address = "10.0.0.1";
+    config.unicast_address = "192.0.2.1";
     config.multicast_rejoin_max_attempts = 0;
     auto server = std::make_shared<SdServer>(config);
 
     ASSERT_TRUE(server->initialize());
-    EXPECT_EQ(server->multicast_state(), MulticastState::Exhausted);
+    EXPECT_EQ(server->multicast_state(), MulticastState::EXHAUSTED);
 
     server->shutdown();
 }
@@ -1298,7 +1302,7 @@ TEST_F(SdTest, ClientReportsJoinedWithNoFailedEventgroupMembership) {
     auto client = std::make_shared<SdClient>(config);
 
     ASSERT_TRUE(client->initialize());
-    EXPECT_EQ(client->eventgroup_multicast_state(), MulticastState::Joined);
+    EXPECT_EQ(client->eventgroup_multicast_state(), MulticastState::JOINED);
 
     client->shutdown();
 }
