@@ -119,7 +119,7 @@ public:
      */
     MulticastState eventgroup_multicast_state() const {
         platform::ScopedLock const lock(pending_multicast_mutex_);
-        bool any_exhausted = false;
+        bool any_exhausted = multicast_tracking_full_;
         for (const auto& pending : pending_multicast_joins_) {
             if (!pending.exhausted) {
                 return MulticastState::RETRYING;
@@ -528,6 +528,16 @@ private:
                 return;
             }
         }
+
+        // A peer chooses the multicast group in a SubscribeEventgroupAck, so the
+        // number of distinct groups whose join fails is not under local control.
+        // Cap the tracking rather than growing it: the dynamic backend's Vector
+        // is a std::vector and would grow without bound, and the static
+        // backend's is fixed-capacity and would trip the ETL error handler.
+        if (pending_multicast_joins_.size() >= MAX_PENDING_MULTICAST_JOINS) {
+            multicast_tracking_full_ = true;
+            return;
+        }
         PendingMulticastJoin entry;
         entry.group = group;
         entry.exhausted = (config_.multicast_rejoin_max_attempts == 0);
@@ -548,6 +558,7 @@ private:
     void clear_multicast_tracking() {
         platform::ScopedLock const lock(pending_multicast_mutex_);
         pending_multicast_joins_.clear();
+        multicast_tracking_full_ = false;
     }
 
     /** @implements REQ_TRANSPORT_011_E03 */
@@ -806,7 +817,12 @@ private:
     };
     // Exhausted entries are retained rather than erased so the aggregate state
     // stays accurate, and so a later successful join for the same group clears it.
+    // That retention is why the count must be bounded explicitly.
+    static constexpr size_t MAX_PENDING_MULTICAST_JOINS = 16;
     platform::Vector<PendingMulticastJoin> pending_multicast_joins_;
+    // Set when a join failure could not be tracked because the cap was reached.
+    // Such a group is never re-attempted, so the aggregate state reports it.
+    bool multicast_tracking_full_{false};
 
     platform::UnorderedMap<uint64_t, CachedService, 32> cached_services_;
     platform::UnorderedMap<uint64_t, EventGroupSubscription, 32> eventgroup_subscriptions_;
