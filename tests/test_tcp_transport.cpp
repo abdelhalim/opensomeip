@@ -697,18 +697,19 @@ TEST_F(TcpTransportTest, ParseNextMessageDistinguishesOutcomes) {
     MessagePtr parsed;
     Result rejection = Result::SUCCESS;
     MessageRejectionStage stage = MessageRejectionStage::DESERIALIZE;
-    EXPECT_EQ(transport.parse_next_message(incomplete, parsed, rejection, stage),
+    size_t skip = 0;
+    EXPECT_EQ(transport.parse_next_message(incomplete, parsed, rejection, stage, skip),
               TcpParseOutcome::NEED_MORE);
 
     platform::ByteBuffer cookie = TcpTransport::make_magic_cookie_client();
-    EXPECT_EQ(transport.parse_next_message(cookie, parsed, rejection, stage),
+    EXPECT_EQ(transport.parse_next_message(cookie, parsed, rejection, stage, skip),
               TcpParseOutcome::CONTROL_FRAME);
 
     Message bad(MessageId(0x1234, 0x5678), RequestId(0xABCD, 0x0001),
                 MessageType::REQUEST, ReturnCode::E_OK);
     bad.set_protocol_version(0x99);
     platform::ByteBuffer bad_buf = bad.serialize();
-    EXPECT_EQ(transport.parse_next_message(bad_buf, parsed, rejection, stage),
+    EXPECT_EQ(transport.parse_next_message(bad_buf, parsed, rejection, stage, skip),
               TcpParseOutcome::REJECTED);
     EXPECT_EQ(rejection, Result::MALFORMED_MESSAGE);
     EXPECT_EQ(stage, MessageRejectionStage::DESERIALIZE);
@@ -716,7 +717,7 @@ TEST_F(TcpTransportTest, ParseNextMessageDistinguishesOutcomes) {
     EXPECT_EQ(parsed->get_service_id(), 0x1234);
 
     platform::ByteBuffer good = original.serialize();
-    EXPECT_EQ(transport.parse_next_message(good, parsed, rejection, stage),
+    EXPECT_EQ(transport.parse_next_message(good, parsed, rejection, stage, skip),
               TcpParseOutcome::MESSAGE);
     ASSERT_NE(parsed, nullptr);
     EXPECT_EQ(parsed->get_service_id(), 0x1234);
@@ -743,7 +744,8 @@ TEST_F(TcpTransportTest, InvalidLengthConsumesHeader) {
     MessagePtr parsed;
     Result rejection = Result::SUCCESS;
     MessageRejectionStage stage = MessageRejectionStage::DESERIALIZE;
-    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage),
+    size_t skip = 0;
+    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage, skip),
               TcpParseOutcome::REJECTED);
     EXPECT_EQ(rejection, Result::MALFORMED_MESSAGE);
     EXPECT_EQ(stage, MessageRejectionStage::TCP_FRAMING);
@@ -753,7 +755,7 @@ TEST_F(TcpTransportTest, InvalidLengthConsumesHeader) {
     EXPECT_EQ(parsed->get_method_id(), 0x5678);
     EXPECT_EQ(parsed->get_client_id(), 0xABCD);
 
-    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage),
+    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage, skip),
               TcpParseOutcome::NEED_MORE);
 }
 
@@ -776,10 +778,11 @@ TEST_F(TcpTransportTest, InvalidLengthResyncsAtMagicCookie) {
     MessagePtr parsed;
     Result rejection = Result::SUCCESS;
     MessageRejectionStage stage = MessageRejectionStage::DESERIALIZE;
-    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage),
+    size_t skip = 0;
+    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage, skip),
               TcpParseOutcome::REJECTED);
     EXPECT_EQ(buffer.size(), cookie.size());
-    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage),
+    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage, skip),
               TcpParseOutcome::CONTROL_FRAME);
     EXPECT_TRUE(buffer.empty());
 }
@@ -807,14 +810,15 @@ TEST_F(TcpTransportTest, OversizedDeclaredLengthReportsBufferOverflow) {
     MessagePtr parsed;
     Result rejection = Result::SUCCESS;
     MessageRejectionStage stage = MessageRejectionStage::DESERIALIZE;
-    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage),
+    size_t skip = 0;
+    EXPECT_EQ(transport.parse_next_message(buffer, parsed, rejection, stage, skip),
               TcpParseOutcome::REJECTED);
     EXPECT_EQ(rejection, Result::BUFFER_OVERFLOW);
     EXPECT_EQ(stage, MessageRejectionStage::TCP_FRAMING);
     EXPECT_TRUE(buffer.empty());
 
     platform::ByteBuffer rest(40, 0xAA);
-    EXPECT_EQ(transport.parse_next_message(rest, parsed, rejection, stage),
+    EXPECT_EQ(transport.parse_next_message(rest, parsed, rejection, stage, skip),
               TcpParseOutcome::NEED_MORE);
     EXPECT_TRUE(rest.empty());
 }
