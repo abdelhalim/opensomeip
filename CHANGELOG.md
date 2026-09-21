@@ -58,6 +58,10 @@
 
 ### Bug Fixes
 
+- **FreeRTOS**: Round positive sleep requests upward when converting milliseconds
+  to ticks, including fractional ticks such as 11 ms at 100 Hz.
+- **Static-allocation tests**: Scope the host heap trap to the thread that arms it,
+  so live transport threads cannot trigger another thread's trap.
 - **RPC**: Release fire-and-forget sessions and guard session ownership while
   constructing a request or inserting its pending registration. Skip both zero
   and still-live call handles when the counter wraps.
