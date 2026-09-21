@@ -18,6 +18,7 @@
 #include "platform/containers.h"
 #include "rpc/rpc_types.h"
 #include "transport/endpoint.h"
+#include "transport/message_rejection.h"
 #include "transport/transport.h"
 
 #ifdef SOMEIP_STATIC_ALLOC
@@ -150,6 +151,17 @@ public:
      * @return true if ready to handle RPC calls
      */
     bool is_ready() const;
+
+    /**
+     * @brief Observe structural rejections of incoming messages.
+     *
+     * Additive; default is no handler. Invoked on the transport receive
+     * thread. Does not send a SOME/IP error response.
+     *
+     * @implements REQ_TRANSPORT_026
+     */
+    void set_message_rejection_handler(
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler);
 
     /**
      * @brief Get server statistics

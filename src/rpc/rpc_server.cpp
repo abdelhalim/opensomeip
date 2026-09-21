@@ -162,6 +162,12 @@ public:
         return RpcServer::Statistics{};
     }
 
+    void set_message_rejection_handler(
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler) {
+        platform::ScopedLock const lock(rejection_mutex_);
+        rejection_handler_ = std::move(handler);
+    }
+
 private:
     struct RegisteredMethod {
         MethodHandler handler;
@@ -254,6 +260,18 @@ private:
         // TODO: Handle transport errors
     }
 
+    /** @implements REQ_TRANSPORT_026 */
+    void on_message_rejected(const transport::MessageRejectionInfo& info) override {
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler;
+        {
+            platform::ScopedLock const lock(rejection_mutex_);
+            handler = rejection_handler_;
+        }
+        if (handler) {
+            handler(info);
+        }
+    }
+
     void stamp_interface_version(Message& msg) const {
         msg.set_interface_version(interface_version_);
     }
@@ -313,6 +331,9 @@ private:
     bool shutting_down_{false};
 
     std::atomic<bool> running_;
+
+    platform::Function<void(const transport::MessageRejectionInfo&)> rejection_handler_;
+    mutable platform::Mutex rejection_mutex_;
 };
 
 #ifdef SOMEIP_STATIC_ALLOC
@@ -385,6 +406,11 @@ transport::Endpoint RpcServer::get_local_endpoint() const {
 
 bool RpcServer::is_ready() const {
     return impl()->is_ready();
+}
+
+void RpcServer::set_message_rejection_handler(
+    platform::Function<void(const transport::MessageRejectionInfo&)> handler) {
+    impl()->set_message_rejection_handler(std::move(handler));
 }
 
 RpcServer::Statistics RpcServer::get_statistics() const {
