@@ -166,9 +166,10 @@ MessagePtr TcpTransport::receive_message_with_sender(Endpoint& sender) {
 }
 
 Result TcpTransport::connect(const Endpoint& endpoint) {
-    // The mode guard has to run before is_connected(): any accepted peer puts a
-    // slot in ACTIVE, so a server that has served one client would otherwise
-    // report SUCCESS here instead of refusing to act as a client.
+    // The mode guard has to run before the already-connected short-circuit:
+    // any accepted peer puts a slot in ACTIVE, so a server that has served one
+    // client would otherwise report SUCCESS here instead of refusing to act as
+    // a client.
     bool server_mode = false;
     {
         platform::ScopedLock const lock(table_mutex_);
@@ -178,8 +179,8 @@ Result TcpTransport::connect(const Endpoint& endpoint) {
         return Result::INVALID_STATE;  // Server mode doesn't connect
     }
 
-    if (is_connected()) {
-        return Result::SUCCESS;  // Already connected
+    if (is_peer_connected(endpoint)) {
+        return Result::SUCCESS;  // Already connected to this peer
     }
 
     return connect_internal(endpoint);

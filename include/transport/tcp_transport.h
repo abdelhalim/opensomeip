@@ -85,7 +85,7 @@ struct TcpTransportConfig {
     std::chrono::milliseconds connection_timeout{5000};     // Connection timeout
     std::chrono::milliseconds receive_timeout{100};        // Receive timeout
     std::chrono::milliseconds send_timeout{1000};          // Send timeout
-    size_t max_receive_buffer{65536};                       // Max receive buffer size
+    size_t max_receive_buffer{65543};  // 8 + MAX_MESSAGE_SIZE, largest accepted frame
     size_t max_connections{10};                             // Concurrent connections (clamped)
     bool keep_alive{true};                                  // TCP keep-alive
     std::chrono::milliseconds keep_alive_interval{30000};   // Keep-alive interval

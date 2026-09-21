@@ -260,6 +260,14 @@
   `INVALID_STATE`. The mode guard now runs before the already-connected
   short-circuit, which any ACTIVE slot — including an accepted peer — had
   been satisfying, so a serving server incorrectly returned `SUCCESS`.
+- **TCP**: client `connect()` short-circuits only when already connected to
+  that peer. `is_connected()` is true for any ACTIVE slot, so a second
+  `connect(B)` after `connect(A)` used to return `SUCCESS` without opening
+  B, and the later `send_message(..., B)` failed with `NOT_CONNECTED`.
+- **TCP**: default `max_receive_buffer` is 65543 (8 + `MAX_MESSAGE_SIZE`) so
+  a legal max-length frame can be received complete. The previous 65536
+  default filled the buffer one byte short of the parser's limit and then
+  closed the peer with `BUFFER_OVERFLOW`.
 
 ### Interop Notes
 
