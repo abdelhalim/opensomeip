@@ -1,0 +1,268 @@
+@startuml transport_class_diagram
+
+title Transport Layer Class Diagram
+
+namespace someip.platform {
+    class Mutex {
+        +lock(): void
+        +unlock(): void
+        +try_lock(): bool
+    }
+
+    class ConditionVariable {
+        +notify_one(): void
+        +wait(mtx: Mutex&): void
+        +wait(mtx: Mutex&, pred: Pred): void
+    }
+
+    class Thread {
+        +Thread(fn: Fn, args: Args...)
+        +join(): void
+        +joinable(): bool
+    }
+
+    class ScopedLock {
+        -m_: Mutex&
+        +ScopedLock(m: Mutex&)
+        +~ScopedLock()
+    }
+
+    ScopedLock --> Mutex : locks
+
+    note as PlatformNote
+        These types are provided by
+        the active backend's thread_impl.h.
+        Actual implementation varies:
+        - POSIX: std::thread / std::mutex
+        - Zephyr: k_thread / k_mutex
+        - FreeRTOS: xTaskCreate / xSemaphore
+        - ThreadX: tx_thread / TX_MUTEX
+    end note
+}
+
+namespace someip.transport {
+    interface ITransport {
+        +send_message(message: Message, endpoint: Endpoint): Result
+        +receive_message(): MessagePtr
+        +connect(endpoint: Endpoint): Result
+        +disconnect(): Result
+        +is_connected(): bool
+        +get_local_endpoint(): Endpoint
+        +set_listener(listener: ITransportListener*): void
+        +start(): Result
+        +stop(): Result
+        +is_running(): bool
+    }
+
+    interface ITransportListener {
+        +on_message_received(message: Message): void
+        +on_connection_lost(endpoint: Endpoint): void
+        +on_connection_established(endpoint: Endpoint): void
+    }
+
+    interface IMulticastTransport {
+        +join_multicast_group(address: string): Result
+        +leave_multicast_group(address: string): Result
+    }
+
+    interface IUdpSocketAdapter {
+        +open(local: Endpoint): Result
+        +close(): void
+        +send(data: ByteBuffer, dest: Endpoint): Result
+        +join_multicast(group: string, iface: string): Result
+        +leave_multicast(group: string, iface: string): Result
+        +set_receive_callback(cb: UdpReceiveCallback): void
+        +get_local_endpoint(): Endpoint
+    }
+
+    interface ITcpSocketAdapter {
+        +open(local: Endpoint): Result
+        +close(): void
+        +listen(backlog: int): Result
+        +connect(remote: Endpoint): Result
+        +accept(remote_out: Endpoint): Result
+        +send(data: ByteBuffer): Result
+        +set_receive_callback(cb: TcpReceiveCallback): void
+        +set_connected_callback(cb: TcpConnectedCallback): void
+        +set_disconnected_callback(cb: TcpDisconnectedCallback): void
+        +get_local_endpoint(): Endpoint
+        +is_connected(): bool
+    }
+
+    class UdpTransport {
+        -local_endpoint_: Endpoint
+        -config_: UdpTransportConfig
+        -socket_fd_: int
+        -running_: std::atomic<bool>
+        -receive_thread_: std::unique_ptr<platform::Thread>
+        -listener_: ITransportListener*
+        -receive_queue_: std::queue<MessagePtr>
+        -queue_mutex_: platform::Mutex
+        -queue_cv_: platform::ConditionVariable
+        -socket_mutex_: platform::Mutex
+
+        +UdpTransport(local_endpoint: Endpoint, config: UdpTransportConfig)
+        +join_multicast_group(address: string): Result
+        +leave_multicast_group(address: string): Result
+        -receive_loop(): void
+        -create_socket(): Result
+        -bind_socket(): Result
+    }
+
+    class TcpTransport {
+        -config_: TcpTransportConfig
+        -local_endpoint_: Endpoint
+        -connection_: TcpConnection
+        -listener_: ITransportListener*
+        -running_: std::atomic<bool>
+        -receive_thread_: std::unique_ptr<platform::Thread>
+        -connection_thread_: std::unique_ptr<platform::Thread>
+        -message_queue_: std::queue<pair<MessagePtr, Endpoint>>
+        -queue_mutex_: platform::Mutex
+        -queue_cv_: platform::ConditionVariable
+        -connection_mutex_: platform::Mutex
+        -server_mode_: bool
+
+        +TcpTransport(config: TcpTransportConfig)
+        +initialize(local_endpoint: Endpoint): Result
+        +enable_server_mode(backlog: int): Result
+        +accept_connection(): int
+        +get_connection_state(): TcpConnectionState
+        -receive_loop(): void
+        -connection_monitor_loop(): void
+    }
+
+    class EventDrivenUdpTransport {
+        -adapter_: IUdpSocketAdapter&
+        -local_endpoint_: Endpoint
+        -config_: EventDrivenUdpTransportConfig
+        -running_: std::atomic<bool>
+        -opened_: std::atomic<bool>
+        -listener_: std::atomic<ITransportListener*>
+        -receive_queue_: platform::Queue<MessagePtr>
+        -queue_mutex_: platform::Mutex
+
+        +EventDrivenUdpTransport(adapter: IUdpSocketAdapter&, local: Endpoint, config: EventDrivenUdpTransportConfig)
+        +join_multicast_group(address: string): Result
+        +leave_multicast_group(address: string): Result
+        -on_adapter_receive(data: ByteBuffer, sender: Endpoint): void
+    }
+
+    class EventDrivenTcpTransport {
+        -adapter_: ITcpSocketAdapter&
+        -config_: EventDrivenTcpTransportConfig
+        -local_endpoint_: Endpoint
+        -connection_remote_: Endpoint
+        -listener_: std::atomic<ITransportListener*>
+        -running_: std::atomic<bool>
+        -initialized_: std::atomic<bool>
+        -receive_buffer_: platform::ByteBuffer
+        -message_queue_: platform::Queue
+        -queue_mutex_: platform::Mutex
+
+        +EventDrivenTcpTransport(adapter: ITcpSocketAdapter&, config: EventDrivenTcpTransportConfig)
+        +initialize(local_endpoint: Endpoint): Result
+        +enable_server_mode(backlog: int): Result
+        +try_accept_connection(remote_out: Endpoint): Result
+        -on_adapter_receive(data: ByteBuffer): void
+        -on_adapter_connected(remote: Endpoint): void
+        -on_adapter_disconnected(): void
+        -parse_next_message(...): ParseOutcome
+    }
+
+    class Endpoint {
+        +address: std::string
+        +port: uint16_t
+        +protocol: TransportProtocol
+
+        +Endpoint(address: string, port: uint16_t, protocol: TransportProtocol)
+        +to_string(): string
+        +is_multicast(): bool
+        +is_valid(): bool
+    }
+
+    enum TransportProtocol {
+        UDP
+        TCP
+    }
+
+    enum TcpConnectionState {
+        DISCONNECTED
+        CONNECTING
+        CONNECTED
+        DISCONNECTING
+    }
+
+    struct UdpTransportConfig {
+        +blocking: bool
+        +receive_buffer_size: size_t
+        +send_buffer_size: size_t
+        +reuse_address: bool
+        +max_message_size: size_t
+    }
+
+    struct TcpTransportConfig {
+        +connection_timeout: milliseconds
+        +receive_timeout: milliseconds
+        +max_connections: size_t
+        +keep_alive: bool
+    }
+
+    struct EventDrivenUdpTransportConfig {
+        +multicast_interface: string
+        +max_message_size: size_t
+    }
+
+    struct EventDrivenTcpTransportConfig {
+        +max_receive_buffer: size_t
+    }
+
+    ' Relationships
+    ITransport <|.. UdpTransport : implements
+    ITransport <|.. TcpTransport : implements
+    ITransport <|.. EventDrivenUdpTransport : implements
+    ITransport <|.. EventDrivenTcpTransport : implements
+    IMulticastTransport <|.. UdpTransport : implements
+    IMulticastTransport <|.. EventDrivenUdpTransport : implements
+
+    UdpTransport --> ITransportListener : notifies
+    TcpTransport --> ITransportListener : notifies
+    EventDrivenUdpTransport --> ITransportListener : notifies
+    EventDrivenTcpTransport --> ITransportListener : notifies
+
+    EventDrivenUdpTransport --> IUdpSocketAdapter : uses
+    EventDrivenTcpTransport --> ITcpSocketAdapter : uses
+
+    UdpTransport *-- Endpoint : local_endpoint_
+    TcpTransport *-- Endpoint : local_endpoint_
+    EventDrivenUdpTransport *-- Endpoint : local_endpoint_
+    EventDrivenTcpTransport *-- Endpoint : local_endpoint_
+    UdpTransport *-- UdpTransportConfig : config_
+    TcpTransport *-- TcpTransportConfig : config_
+    EventDrivenUdpTransport *-- EventDrivenUdpTransportConfig : config_
+    EventDrivenTcpTransport *-- EventDrivenTcpTransportConfig : config_
+    TcpTransport *-- TcpConnectionState : uses
+
+    Endpoint *-- TransportProtocol : uses
+}
+
+' PAL usage
+someip.transport.UdpTransport --> someip.platform.Thread : receive_thread_
+someip.transport.UdpTransport --> someip.platform.Mutex : queue_mutex_\nsocket_mutex_
+someip.transport.UdpTransport --> someip.platform.ConditionVariable : queue_cv_
+someip.transport.TcpTransport --> someip.platform.Thread : receive_thread_\nconnection_thread_
+someip.transport.TcpTransport --> someip.platform.Mutex : queue_mutex_\nconnection_mutex_
+someip.transport.TcpTransport --> someip.platform.ConditionVariable : queue_cv_
+someip.transport.EventDrivenUdpTransport --> someip.platform.Mutex : queue_mutex_
+someip.transport.EventDrivenTcpTransport --> someip.platform.Mutex : queue_mutex_
+
+note bottom of someip.transport
+    Threaded transports use platform:: types
+    for threading and platform/net.h sockets.
+    Event-driven transports use integrator
+    adapters (IUdpSocketAdapter / ITcpSocketAdapter)
+    and deliver one frame at a time with no
+    unbounded MessagePtr staging vector.
+end note
+
+@enduml
