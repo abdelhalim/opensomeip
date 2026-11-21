@@ -48,6 +48,7 @@ TEST_F(EtlErrorHandlerTest, HandlerIsRegistered) {
 /**
  * @test_case TC_ETL_HANDLER_VECTOR_OVERFLOW
  * @tests REQ_PAL_ETL_ERROR_HANDLER
+ * @tests REQ_PAL_CONTAINER_CAPACITY_E01
  *
  * Overflowing a bounded vector must invoke the error handler
  * (incrementing the error count) without aborting/terminating.
@@ -70,7 +71,7 @@ TEST_F(EtlErrorHandlerTest, VectorOverflowInvokesHandler) {
 
 /**
  * @test_case TC_ETL_MAP_FULL_CHECK
- * @tests REQ_PAL_ETL_ERROR_HANDLER
+ * @tests REQ_PAL_CONTAINER_MAP
  *
  * ETL unordered_map does NOT degrade gracefully on overflow (it segfaults),
  * so callers MUST use full() before insert. Verify the full() API works.
@@ -88,6 +89,7 @@ TEST_F(EtlErrorHandlerTest, MapFullCheckPreventsOverflow) {
 /**
  * @test_case TC_ETL_HANDLER_NO_ABORT
  * @tests REQ_PAL_ETL_ERROR_HANDLER
+ * @tests REQ_PAL_CONTAINER_CAPACITY_E01
  *
  * Multiple overflows should all be handled gracefully — no
  * abort, no exception, just error count increments.

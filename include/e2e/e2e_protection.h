@@ -50,7 +50,14 @@ public:
      * @brief Protect a message before sending
      *
      * Adds E2E header to the message according to SOME/IP spec feat_req_someip_102.
-     * The header is inserted after the Return Code field.
+     * Default Offset 64 bits places a header immediately after Return Code.
+     * A larger byte-aligned Offset places it after an unprotected prefix that
+     * the caller stored with Message::set_e2e_unprotected_prefix().
+     * Offset overlap or a non-multiple of 8 returns Result::INVALID_ARGUMENT.
+     * A prefix or profile header above the compile-time cap returns
+     * Result::NOT_IMPLEMENTED. Result::NOT_INITIALIZED is returned first
+     * when no profile is registered. CRC, Data ID, and replay failures stay
+     * Result::INVALID_ARGUMENT.
      *
      * @param message Message to protect
      * @param config E2E configuration
@@ -62,6 +69,7 @@ public:
      * @brief Validate a received message
      *
      * Validates the E2E header and checks CRC, counter, and freshness.
+     * Applies the same Offset and header-size contract as protect().
      *
      * @param message Message to validate
      * @param config E2E configuration

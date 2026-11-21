@@ -14,16 +14,22 @@
 #ifndef SOMEIP_RPC_SERVER_H
 #define SOMEIP_RPC_SERVER_H
 
-#include "rpc/rpc_types.h"
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
+#include "rpc/rpc_types.h"
 #include "transport/endpoint.h"
+#include "transport/message_rejection.h"
+#include "transport/transport.h"
 
 #ifdef SOMEIP_STATIC_ALLOC
 #include "static_config.h"
 #else
 #include <memory>
 #endif
+
+namespace someip::transport {
+class ServiceDemux;
+}
 
 namespace someip::rpc {
 
@@ -65,6 +71,39 @@ public:
                            transport::Endpoint("127.0.0.1", SOMEIP_DEFAULT_RPC_PORT));
 
     /**
+     * @brief Borrow an exclusive, stopped transport instead of creating UDP.
+     * @param service_id Service identifier handled by this server.
+     * @param transport Must outlive this server; the server manages start/stop.
+     * @param interface_version Service major / Interface Version accepted by this server.
+     * @note The supplied backend controls its bind endpoint; no default port is imposed.
+     * @see transport::ITransport for the injected-transport lifecycle contract.
+     */
+    RpcServer(uint16_t service_id, transport::ITransport& transport,
+              uint8_t interface_version = 0x01);
+
+    /**
+     * @brief Register this service on a shared socket.
+     *
+     * The demux borrows one UdpTransport or TcpTransport and is its listener.
+     * initialize() registers service_id and does not start or stop the
+     * transport. A second server with a different service id is added beside
+     * this one. A second server with the same service id fails initialize()
+     * and leaves the first registration in place. Two instances of one
+     * service id need two demuxes on two ports.
+     *
+     * The demux and the transport must outlive this server. shutdown()
+     * removes only this service id. Call it, and do not destroy this server,
+     * from a transport callback.
+     *
+     * @param service_id Service identifier handled by this server.
+     * @param demux Shared-socket dispatcher. Include transport/service_demux.h.
+     * @param interface_version Service major accepted by this server.
+     * @see transport::ServiceDemux
+     */
+    RpcServer(uint16_t service_id, transport::ServiceDemux& demux,
+              uint8_t interface_version = 0x01);
+
+    /**
      * @brief Destructor
      */
     ~RpcServer();
@@ -78,13 +117,27 @@ public:
     /**
      * @brief Initialize the RPC server
      * @return true on success, false on failure
+     * @note Serialized with shutdown(). Method registration before initialization is allowed.
+     * @warning Do not call lifecycle operations from method/transport callbacks or capture
+     *          destructors. Join outstanding API calls before destroying the server.
      */
     bool initialize();
 
     /**
      * @brief Shutdown the RPC server
+     * @note Serialized with initialize() and other shutdown() calls through complete cleanup.
+     *       Registration is rejected during teardown and allowed again after it finishes.
+     * @warning Must not be called from method/transport callbacks or capture destructors:
+     *          stopping the transport waits for callbacks to finish.
      */
     void shutdown();
+
+    /**
+     * @brief Result of the last transport start/stop (including failed-start cleanup).
+     * @return SUCCESS initially, otherwise the last lifecycle outcome; not a receive error.
+     * @note Safe to query during initialize/shutdown; object destruction must be serialized.
+     */
+    Result get_transport_result() const;
 
     /**
      * @brief Register a method handler
@@ -133,6 +186,17 @@ public:
     bool is_ready() const;
 
     /**
+     * @brief Observe structural rejections of incoming messages.
+     *
+     * Additive; default is no handler. Invoked on the transport receive
+     * thread. Does not send a SOME/IP error response.
+     *
+     * @implements REQ_TRANSPORT_026
+     */
+    void set_message_rejection_handler(
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler);
+
+    /**
      * @brief Get server statistics
      *
      * @return Statistics about handled RPC calls
@@ -148,6 +212,7 @@ public:
 
 private:
 #ifdef SOMEIP_STATIC_ALLOC
+    /** @implements REQ_PLATFORM_STATIC_005 */
     alignas(alignof(std::max_align_t)) char impl_storage_[SOMEIP_PIMPL_RPCSERVER_SIZE];
     RpcServerImpl* impl() noexcept { return reinterpret_cast<RpcServerImpl*>(impl_storage_); }
     const RpcServerImpl* impl() const noexcept { return reinterpret_cast<const RpcServerImpl*>(impl_storage_); }

@@ -16,6 +16,7 @@
 #include <tp/tp_segmenter.h>
 #include <tp/tp_reassembler.h>
 #include <someip/message.h>
+#include <common/result.h>
 #include <e2e/e2e_header.h>
 #include <algorithm>
 #include <thread>
@@ -47,7 +48,7 @@ using namespace someip::tp;
  * @tests REQ_TP_082_E01, REQ_TP_082_E02, REQ_TP_082_E03, REQ_TP_082_E04
  * @tests feat_req_someiptp_400
  * @tests feat_req_someiptp_402
- * @tests feat_req_someiptp_772, feat_req_someiptp_782, feat_req_someiptp_792
+ * @tests feat_req_someiptp_782, REQ_TP_044
  * @tests feat_req_someiptp_410
  * @tests feat_req_someip_761
  * @tests REQ_MSG_056, REQ_MSG_060_TP_RESPONSE
@@ -57,6 +58,10 @@ class TpTest : public ::testing::Test {
 protected:
     void SetUp() override {
         config.max_segment_size = 512;  // Small for testing
+        // Keep the fixture's segmentation threshold at a 512-byte payload.
+        // The ceiling is the serialized message, so the budget includes the header.
+        config.max_single_datagram_size =
+            static_cast<uint32_t>(Message::get_header_size()) + config.max_segment_size;
         config.max_message_size = 10000;
         config.reassembly_timeout = std::chrono::milliseconds(1000);
     }
@@ -313,21 +318,40 @@ TEST_F(TpTest, StatisticsTracking) {
  */
 TEST_F(TpTest, MaximumSegmentSize) {
     TpConfig test_config;
-    // Verify the max segment size is set to 1392 bytes (87 * 16)
-    EXPECT_EQ(test_config.max_segment_size, 1392u);
+    EXPECT_EQ(test_config.max_segment_size, DEFAULT_MAX_SEGMENT_PAYLOAD);
+    EXPECT_EQ(test_config.max_single_datagram_size, DEFAULT_SINGLE_DATAGRAM_SIZE);
+    EXPECT_GE(test_config.max_single_datagram_size, 1416u);
 
-    // Test that messages larger than 1392 bytes get segmented
     TpSegmenter segmenter(test_config);
 
-    Message message(MessageId(0x1234, 0x5678), RequestId(0xABCD, 0x0001),
-                   MessageType::REQUEST, ReturnCode::E_OK);
-    platform::ByteBuffer large_payload(1393, 0xAA);
-    message.set_payload(large_payload);
+    Message fits(MessageId(0x1234, 0x5678), RequestId(0xABCD, 0x0001),
+                 MessageType::REQUEST, ReturnCode::E_OK);
+    platform::ByteBuffer one_datagram(1400, 0xAA);
+    ASSERT_EQ(one_datagram.size(), 1400u);
+    fits.set_payload(one_datagram);
+
+    TpSegmentVector single;
+    EXPECT_EQ(segmenter.segment_message(fits, single), TpResult::SUCCESS);
+    ASSERT_EQ(single.size(), 1u);
+    EXPECT_EQ(single[0].header.message_type, TpMessageType::SINGLE_MESSAGE);
+    EXPECT_EQ(single[0].payload.size(), 1416u);
+    EXPECT_EQ(single[0].payload[14] & 0x20, 0u);
+    EXPECT_NE(1400u % 16u, 0u);
+
+    Message over(MessageId(0x1234, 0x5678), RequestId(0xABCD, 0x0002),
+                 MessageType::REQUEST, ReturnCode::E_OK);
+    platform::ByteBuffer past_budget(1401, 0xBB);
+    ASSERT_EQ(past_budget.size(), 1401u);
+    over.set_payload(past_budget);
 
     TpSegmentVector segments;
-    TpResult result = segmenter.segment_message(message, segments);
-    EXPECT_EQ(result, TpResult::SUCCESS);
+    EXPECT_EQ(segmenter.segment_message(over, segments), TpResult::SUCCESS);
     EXPECT_GT(segments.size(), 1u);
+    for (size_t i = 0; i + 1 < segments.size(); ++i) {
+        ASSERT_GT(segments[i].payload.size(), 20u);
+        EXPECT_EQ((segments[i].payload.size() - 20u) % 16u, 0u);
+        EXPECT_NE(segments[i].payload[14] & 0x20, 0u);
+    }
 }
 
 /**
@@ -351,7 +375,7 @@ TEST_F(TpTest, SegmentAlignment) {
     // Check alignment of all segments except the last
     for (size_t i = 0; i < segments.size() - 1; ++i) {
         // All segments: subtract 20 (SOME/IP header + TP header) to get payload
-        // Payload of non-last segments must be multiple of 16 (feat_req_someiptp_772)
+        // Payload of non-last segments must be multiple of 16 (REQ_TP_003)
         ASSERT_GT(segments[i].payload.size(), 20u);
         size_t data_size = segments[i].payload.size() - 20;
         EXPECT_EQ(data_size % 16, 0u) << "Segment " << i << " payload not 16-byte aligned";
@@ -1244,28 +1268,45 @@ TEST_F(TpTest, ZeroPayloadTpSegmentDoesNotComplete) {
 }
 
 /**
- * @test_case TC_TP_NEEDS_SEGMENTATION_USES_PAYLOAD
+ * @test_case TC_TP_NEEDS_SEGMENTATION_USES_SERIALIZED
  * @tests REQ_TP_001
- * @brief TpManager::needs_segmentation compares payload size, not serialized size
+ * @brief Segmentation follows the serialized message, header included
  */
-TEST_F(TpTest, NeedsSegmentationUsesPayloadSize) {
-    TpConfig test_config;
-    test_config.max_segment_size = 100;
-    TpManager tp_manager(test_config);
-    ASSERT_TRUE(tp_manager.initialize());
+TEST_F(TpTest, NeedsSegmentationUsesSerializedSize) {
+    TpConfig defaults;
+    TpManager default_manager(defaults);
+    ASSERT_TRUE(default_manager.initialize());
 
     Message msg(MessageId(0x1234, 0x5678), RequestId(0xABCD, 0x0001),
                MessageType::REQUEST, ReturnCode::E_OK);
 
-    // Payload = 100 bytes → fits (≤ max_segment_size)
+    msg.set_payload(platform::ByteBuffer(1400, 0xAA));
+    ASSERT_EQ(msg.get_payload().size(), 1400u);
+    EXPECT_EQ(msg.get_total_size(), 1416u);
+    EXPECT_FALSE(default_manager.needs_segmentation(msg))
+        << "1400-byte payload plus the 16-byte header fits the default budget";
+
+    msg.set_payload(platform::ByteBuffer(1401, 0xBB));
+    ASSERT_EQ(msg.get_total_size(), 1417u);
+    EXPECT_TRUE(default_manager.needs_segmentation(msg))
+        << "one byte past the serialized budget must be segmented";
+    default_manager.shutdown();
+
+    // A lowered budget still keys off the serialized size, not max_segment_size.
+    TpConfig test_config;
+    test_config.max_segment_size = 100;
+    test_config.max_single_datagram_size =
+        static_cast<uint32_t>(Message::get_header_size()) + 100;
+    TpManager tp_manager(test_config);
+    ASSERT_TRUE(tp_manager.initialize());
+
     msg.set_payload(platform::ByteBuffer(100, 0xAA));
     EXPECT_FALSE(tp_manager.needs_segmentation(msg))
-        << "100-byte payload must not need segmentation with max_segment_size=100";
+        << "serialized size equal to the budget must stay one message";
 
-    // Payload = 101 bytes → needs segmentation
     msg.set_payload(platform::ByteBuffer(101, 0xBB));
     EXPECT_TRUE(tp_manager.needs_segmentation(msg))
-        << "101-byte payload must need segmentation with max_segment_size=100";
+        << "serialized size one past the budget must be segmented";
 
     tp_manager.shutdown();
 }
@@ -1848,19 +1889,29 @@ TEST_F(TpTest, RejectInvalidReconstructedHeader) {
     EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete));
 }
 
+TEST_F(TpTest, IngestDatagramReportsErrorOnLengthMismatch) {
+    TpManager manager(config);
+    ASSERT_TRUE(manager.initialize());
+
+    platform::ByteBuffer datagram(20, 0);
+    datagram[14] = 0x20;  // TP flag; declared length 0 does not match size 20
+    Result err = Result::SUCCESS;
+    Message complete;
+    EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete, 0, 0, &err));
+    EXPECT_EQ(err, Result::MALFORMED_MESSAGE);
+}
+
 // ============================================================================
-// Fix 1: Misaligned non-final segment rejection (feat_req_someiptp_772)
+// Fix 1: Misaligned non-final segment rejection (REQ_TP_044)
 // ============================================================================
 
 /**
  * @test_case TC_TP_MISALIGNED_NONFINAL_REJECTED
- * @tests feat_req_someiptp_772, feat_req_someiptp_792
+ * @tests REQ_TP_044
  * @brief Non-final TP segment with payload not a multiple of 16 bytes is rejected
  *
- * Per feat_req_someiptp_772 (SHALL): "all but the last segment shall have a
- * length that is a multiple of 16 bytes".
- * Per feat_req_someiptp_792 (SHALL): "cancel reassembly if segment length of
- * a segment with MS=1 is not a multiple of 16".
+ * REQ_TP_044 rejects a segment with More Segments = 1 whose payload length
+ * is not a multiple of 16 bytes. The last segment may have any length.
  */
 TEST_F(TpTest, MisalignedNonFinalSegmentRejected) {
     TpManager manager(config);
@@ -1889,13 +1940,15 @@ TEST_F(TpTest, MisalignedNonFinalSegmentRejected) {
     std::fill(datagram.begin() + 20, datagram.end(), 0xAA);
 
     Message complete;
-    EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete))
+    Result err = Result::SUCCESS;
+    EXPECT_FALSE(manager.ingest_datagram(datagram.data(), datagram.size(), complete, 0, 0, &err))
         << "Non-final segment with 17-byte payload (not 16-aligned) must be rejected";
+    EXPECT_EQ(err, Result::MALFORMED_MESSAGE);
 }
 
 /**
  * @test_case TC_TP_ALIGNED_NONFINAL_ACCEPTED
- * @tests feat_req_someiptp_772
+ * @tests REQ_TP_044
  * @brief Non-final TP segment with 16-byte-aligned payload is accepted
  */
 TEST_F(TpTest, AlignedNonFinalSegmentAccepted) {
@@ -1929,7 +1982,7 @@ TEST_F(TpTest, AlignedNonFinalSegmentAccepted) {
 
 /**
  * @test_case TC_TP_MISALIGNED_FINAL_ACCEPTED
- * @tests feat_req_someiptp_772
+ * @tests REQ_TP_044
  * @brief Final TP segment (More=0) with non-16-aligned payload is accepted
  *
  * Only non-final segments must be 16-byte aligned; the last segment can be any size.
@@ -2007,7 +2060,7 @@ TEST_F(TpTest, MaxTpReassemblySizeIsAtLeast16) {
 }
 
 // ============================================================================
-// Fix: Overlapping TP segment handling — first-wins (feat_req_someiptp_797)
+// Fix: Overlapping TP segment handling — first-wins (REQ_TP_081_FW)
 // ============================================================================
 
 namespace {
@@ -2054,11 +2107,48 @@ platform::ByteBuffer make_tp_datagram(uint16_t service, uint16_t method,
     return dg;
 }
 
+#ifdef SOMEIP_STATIC_ALLOC
+/**
+ * @test_case TC_TP_REASSEMBLY_CLAMP
+ * @tests REQ_TP_030_E03
+ * @brief Static builds clamp max_message_size to the compile-time reassembly buffer.
+ *
+ * A segment that starts at the buffer capacity fits an unclamped config and
+ * does not fit once construction or update_config reduces the limit.
+ */
+TEST_F(TpTest, StaticBuildClampsReassemblySize) {
+    const auto cap = static_cast<uint32_t>(MAX_TP_REASSEMBLY_SIZE);
+    const platform::ByteBuffer chunk(16, 0x11);
+    const auto over_cap = make_tp_datagram(0x1234, 0x0001, 0x0001, 0x0001, cap, false, chunk);
+    const auto within = make_tp_datagram(0x1234, 0x0001, 0x0001, 0x0002, 0, true, chunk);
+
+    TpSegment over_segment;
+    TpSegment within_segment;
+    ASSERT_TRUE(parse_wire_segment(over_cap.data(), over_cap.size(), over_segment));
+    ASSERT_TRUE(parse_wire_segment(within.data(), within.size(), within_segment));
+
+    TpConfig oversized = config;
+    oversized.max_message_size = cap + 1000U;
+    TpReassembler constructed(oversized);
+    platform::ByteBuffer complete;
+    EXPECT_FALSE(constructed.process_segment(over_segment, complete));
+    EXPECT_TRUE(constructed.process_segment(within_segment, complete));
+
+    TpConfig small = config;
+    small.max_message_size = 64U;
+    TpReassembler updated(small);
+    TpConfig raised = config;
+    raised.max_message_size = cap + 1000U;
+    updated.update_config(raised);
+    EXPECT_FALSE(updated.process_segment(over_segment, complete));
+}
+#endif
+
 }  // namespace
 
 /**
  * @test_case TC_TP_OVERLAP_SAME_DATA
- * @tests feat_req_someiptp_797
+ * @tests REQ_TP_081_FW
  * @brief Overlapping segment with identical data succeeds (first-wins, no corruption)
  *
  * Segment A: offset 0, 32 bytes of 0xAA (more=1)
@@ -2088,7 +2178,7 @@ TEST_F(TpTest, OverlapSameDataSucceeds) {
 
 /**
  * @test_case TC_TP_OVERLAP_DIFFERENT_DATA_FIRST_WINS
- * @tests feat_req_someiptp_797
+ * @tests REQ_TP_081_FW
  * @brief Overlapping segment with different data → first-wins preserves original bytes
  *
  * Segment A: offset 0, 32 bytes of 0xAA (more=1)  → covers [0..31]
@@ -2130,7 +2220,7 @@ TEST_F(TpTest, OverlapDifferentDataFirstWins) {
 
 /**
  * @test_case TC_TP_EXACT_DUPLICATE_ACCEPTED
- * @tests feat_req_someiptp_797
+ * @tests REQ_TP_081_FW
  * @brief Exact duplicate segment is accepted without changing data
  *
  * Send segment A twice (offset 0, 32 bytes 0xAA, more=1).

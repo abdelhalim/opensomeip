@@ -19,7 +19,11 @@
 namespace someip {
 namespace platform {
 
+/** @implements REQ_PLATFORM_WIN32_001 */
 using Mutex = std::mutex;
+
+/** @brief Opaque identity of a thread, usable for per-thread reentrancy checks. */
+using ThreadId = std::thread::id;
 
 /** @implements REQ_PAL_THREAD_CREATE, REQ_PAL_THREAD_JOINABLE, REQ_PAL_THREAD_JOIN, REQ_PAL_THREAD_NONCOPY, REQ_PAL_THREAD_CREATE_E01, REQ_PAL_THREAD_DTOR_E01 */
 class Thread {
@@ -72,6 +76,10 @@ private:
 
 namespace this_thread {
 using std::this_thread::sleep_for;
+
+/** @brief Identity of the calling thread.
+ * @implements REQ_PAL_THREAD_ID */
+using std::this_thread::get_id;
 } // namespace this_thread
 
 } // namespace platform

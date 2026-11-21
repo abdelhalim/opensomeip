@@ -23,23 +23,25 @@ The RPC layer provides high-level interfaces for making method calls between SOM
 - **Purpose**: Client-side interface for making RPC method calls
 - **Features**:
   - Synchronous and asynchronous method calls
-  - Fire-and-forget `REQUEST_NO_RETURN`
-  - Explicit remote endpoint (not the SD port)
+  - Fire-and-forget `REQUEST_NO_RETURN` (`send_request_no_return`)
+  - Explicit remote endpoint (offered service address, not the SD port)
   - Service major / Interface Version on outgoing messages
   - Automatic timeout handling
   - Request/response correlation
   - Call cancellation support
   - Statistics tracking
+  - Incoming-message rejection callback (`set_message_rejection_handler`)
 
 #### RpcServer
 - **Purpose**: Server-side interface for handling RPC method calls
 - **Features**:
-  - Method handler registration (request/response or fire-and-forget)
-  - Default bind `127.0.0.1:30501`
-  - `E_WRONG_INTERFACE_VERSION` on major mismatch
+  - Method handler registration with request/response or fire-and-forget semantics
+  - Binds an application RPC endpoint (default `127.0.0.1:30501`, not port 30490)
+  - `E_WRONG_INTERFACE_VERSION` when a response-expecting request's major does not match
   - Automatic response generation
   - Error handling and return codes
   - Statistics tracking
+  - Incoming-message rejection callback (`set_message_rejection_handler`)
 
 #### RpcTypes
 - **Purpose**: Common types and constants for RPC operations
@@ -54,16 +56,17 @@ The RPC layer provides high-level interfaces for making method calls between SOM
 
 ```cpp
 #include <rpc/rpc_server.h>
+#include <transport/endpoint.h>
 
 using namespace someip::rpc;
 
-// Create server for service ID 0x1234
-RpcServer server(0x1234);
+// Create server for service ID 0x1234, major 0x01, application RPC port
+RpcServer server(0x1234, 0x01, someip::transport::Endpoint("127.0.0.1", SOMEIP_DEFAULT_RPC_PORT));
 
 // Initialize server
 server.initialize();
 
-// Register method handler
+// Register method handler (request/response by default)
 server.register_method(0x0001, [](uint16_t client_id, uint16_t session_id,
                                  const std::vector<uint8_t>& input,
                                  std::vector<uint8_t>& output) -> RpcResult {
@@ -71,6 +74,13 @@ server.register_method(0x0001, [](uint16_t client_id, uint16_t session_id,
     // Generate output parameters
     return RpcResult::SUCCESS;
 });
+
+// Fire-and-forget method: incoming REQUEST_NO_RETURN runs the handler with no RESPONSE
+server.register_method(0x0002, [](uint16_t, uint16_t,
+                                 const std::vector<uint8_t>&,
+                                 std::vector<uint8_t>&) -> RpcResult {
+    return RpcResult::SUCCESS;
+}, MethodSemantics::FIRE_AND_FORGET);
 
 // Server runs until shutdown
 server.shutdown();
@@ -80,18 +90,18 @@ server.shutdown();
 
 ```cpp
 #include <rpc/rpc_client.h>
-#include <rpc/rpc_types.h>
+#include <transport/endpoint.h>
 
 using namespace someip::rpc;
 
-// Create client with ID 0xABCD
-RpcClient client(0xABCD);
-
-// Configure the remote endpoint (offered-service RPC port, not the SD port)
-client.set_remote_endpoint(someip::transport::Endpoint("127.0.0.1", SOMEIP_DEFAULT_RPC_PORT));
+// Create client with ID 0xABCD (optional service major, ephemeral local bind)
+RpcClient client(0xABCD, 0x01);
 
 // Initialize client
 client.initialize();
+
+// Destination is the offered service endpoint — never the SD port (30490)
+client.set_remote_endpoint(someip::transport::Endpoint("127.0.0.1", SOMEIP_DEFAULT_RPC_PORT));
 
 // Synchronous call
 RpcSyncResult result = client.call_method_sync(0x1234, 0x0001, parameters);
@@ -101,6 +111,10 @@ RpcCallHandle handle = client.call_method_async(0x1234, 0x0001, parameters,
     [](const RpcResponse& response) {
         // Handle response
     });
+
+// Fire-and-forget (message type REQUEST_NO_RETURN / 0x01)
+client.send_request_no_return(0x1234, 0x0002, parameters,
+    someip::transport::Endpoint("127.0.0.1", SOMEIP_DEFAULT_RPC_PORT));
 
 // Cancel async call if needed
 client.cancel_call(handle);
@@ -137,7 +151,8 @@ Client                  Server
 
 ### Message Types Used
 
-- **REQUEST**: Client to server method invocation
+- **REQUEST**: Client to server method invocation (response required)
+- **REQUEST_NO_RETURN**: Fire-and-forget request (no response)
 - **RESPONSE**: Server to client method result (success)
 - **ERROR**: Server to client method result (failure)
 
@@ -166,15 +181,14 @@ timeout.response_timeout = std::chrono::milliseconds(5000);
 ### Client Configuration
 
 ```cpp
-RpcClient client(client_id);
+RpcClient client(client_id);  // major 0x01, binds 0.0.0.0:0 (ephemeral)
 client.set_remote_endpoint(someip::transport::Endpoint("127.0.0.1", SOMEIP_DEFAULT_RPC_PORT));
 ```
 
 ### Server Configuration
 
 ```cpp
-RpcServer server(service_id);
-// Server binds to 127.0.0.1:30501 by default (application RPC, not SD)
+RpcServer server(service_id);  // major 0x01, binds 127.0.0.1:30501 by default
 ```
 
 ## Error Handling
@@ -198,6 +212,8 @@ RpcServer server(service_id);
 Unit tests cover:
 - Method registration/unregistration
 - Synchronous and asynchronous calls
+- Fire-and-forget `REQUEST_NO_RETURN`
+- Service major / Interface Version round-trip and mismatch errors
 - Timeout behavior
 - Error handling
 - Statistics tracking

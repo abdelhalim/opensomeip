@@ -223,7 +223,10 @@ Length Field Parsing
    total SOME/IP message size minus 8 bytes (Message ID + Length fields).
 
    **Rationale**: Length field covers Request ID, Protocol Version,
-   Interface Version, Message Type, Return Code, and payload.
+   Interface Version, Message Type, Return Code, and everything after
+   Return Code. When E2E is present that includes the unprotected prefix
+   (Offset greater than 64 bits), the profile header, and the application
+   payload.
 
    **Code Location**: ``src/someip/message.cpp``
 
@@ -1521,17 +1524,23 @@ Event and Field Support
 .. requirement:: Selective Event Sending
    :id: REQ_MSG_122
    :satisfies: feat_req_someip_804, feat_req_someip_806
-   :status: implemented
+   :status: pending
    :priority: medium
    :category: happy_path
-   :verification: Unit test: Set event filter on subscriber to accept only eventgroup_id=0x01, publish events for groups 0x01 and 0x02, verify subscriber receives only 0x01.
+   :verification: Pending: demonstrate application-controlled selection of recipients and verify excluded clients receive no notification.
 
    The software should support sending events to a subset of subscribed
    clients, controlled by the application.
 
    **Rationale**: Selective sending reduces bandwidth when not all subscribers need every event.
 
-   **Code Location**: ``src/events/event_subscriber.cpp`` (set_event_filters), ``include/events/event_types.h`` (EventFilter)
+   **Implementation limitation**: ``EventFilter`` metadata is stored but not
+   evaluated during delivery; ``set_event_filters`` is not evidence of selective
+   sending. Each ``EventSubscriber`` accepts only one instance/eventgroup key per
+   service because notifications do not carry instance/eventgroup identity.
+   Admission tests in ``tests/test_subscriber_dispatch.cpp`` cover that restriction,
+   not selective sending. Supporting multiple keys requires an explicit receive
+   binding/membership design; optional filters alone cannot provide it.
 
 .. requirement:: Field Getter Support
    :id: REQ_MSG_123
@@ -1546,7 +1555,7 @@ Event and Field Support
 
    **Rationale**: Field getters allow clients to read current field values on demand.
 
-   **Code Location**: ``src/events/event_subscriber.cpp`` (request_field), ``include/events/event_subscriber.h``
+   **Code Location**: ``src/events/event_subscriber.cpp`` (request_field), ``src/events/event_publisher.cpp`` (getter response)
 
 .. requirement:: Field Setter Support
    :id: REQ_MSG_124
@@ -1562,7 +1571,7 @@ Event and Field Support
 
    **Rationale**: Field setters allow clients to update field values with server-side validation.
 
-   **Code Location**: ``src/events/event_publisher.cpp`` (publish_field), ``include/events/event_publisher.h``
+   **Code Location**: ``src/events/event_subscriber.cpp`` (set_field), ``src/events/event_publisher.cpp`` (setter response)
 
 .. requirement:: Field Notifier Support
    :id: REQ_MSG_125
@@ -1592,7 +1601,7 @@ Event and Field Support
 
    **Rationale**: A field without any accessor serves no purpose and indicates a design error.
 
-   **Code Location**: ``include/events/event_publisher.h``
+   **Code Location**: ``src/events/event_publisher.cpp`` (register_event)
 
 
 Error Handling Extensions
@@ -1836,6 +1845,25 @@ Header Informational References
 
    **Code Location**: ``include/someip/message.h``, ``src/someip/message.cpp``
 
+.. requirement:: Non-owning Payload View
+   :id: REQ_MSG_151
+   :status: implemented
+   :priority: high
+   :category: happy_path
+   :verification: Unit test: ``test_message.cpp`` — TC_PAYLOADVIEW_001 through TC_PAYLOADVIEW_005. A view of a four-byte payload reports that size, the first and last bytes, and the same data pointer as ``get_payload()``. An empty payload yields an empty view. ``subview(1, 3)`` returns three bytes starting at the second. ``subview(3, 10)`` on a five-byte payload returns the two bytes that remain. Range-for visits each byte. ``test_static_alloc_integration.cpp`` — TC_STATIC_INT_PAYLOADVIEW reads the view under a malloc trap.
+
+   ``Message::payload_view()`` shall return a non-owning view of the message
+   payload. The view shall expose the payload bytes and their size, return a
+   sub-range clipped to the payload, and iterate those bytes without copying
+   them or allocating memory.
+
+   **Rationale**: Callers need to read a payload in place on both the
+   heap-backed and the static-allocation message buffers. No specification
+   sentence defines this view.
+
+   **Code Location**: ``include/someip/payload_view.h``,
+   ``include/someip/message.h`` (``payload_view``)
+
 
 .. requirement:: Error - Invalid Service Instance ID
    :id: REQ_MSG_110_E01
@@ -1970,7 +1998,7 @@ Header Informational References
 
    **Error Handling**: Return E_UNKNOWN_METHOD in error response.
 
-   **Code Location**: ``src/events/event_subscriber.cpp``
+   **Code Location**: ``src/events/event_publisher.cpp`` (unknown getter or setter method)
 
 .. requirement:: Error - Field Setter Validation Failure
    :id: REQ_MSG_124_E01

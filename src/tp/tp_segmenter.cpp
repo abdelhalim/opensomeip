@@ -47,10 +47,11 @@ TpResult TpSegmenter::segment_message(const Message& message, TpSegmentVector& s
         return TpResult::MESSAGE_TOO_LARGE;
     }
 
-    if (payload.size() <= config_.max_segment_size) {
-        // Payload fits in one non-TP SOME/IP message: no TP-Flag, no TP header.
+    // Ceiling is the serialized message, header included. A payload that is
+    // not a multiple of 16 is still one SOME/IP message when it fits.
+    // 16-byte alignment is applied only while building TP segments.
+    if (message.get_total_size() <= config_.max_single_datagram_size) {
         platform::ByteBuffer message_data = message.serialize();
-
         if (message_data.size() > UINT16_MAX) {
             return TpResult::SEGMENTATION_FAILED;
         }
@@ -76,8 +77,11 @@ TpResult TpSegmenter::segment_message(const Message& message, TpSegmentVector& s
         return TpResult::SUCCESS;
     }
 
-    // TP segmentation is incompatible with E2E protection: create_multi_segments
-    // calls serialize()+resize(16) which silently drops the E2E suffix.
+    // Default E2E (Offset 64) and TP both start at wire byte 16. A message that
+    // already carries an E2E header — any Offset or header size — is not
+    // segmented. Reassembly must finish before E2E is parsed, and a non-default
+    // Offset does not lift this refusal. create_multi_segments calls
+    // serialize()+resize(16), which would drop the header and any prefix.
     if (message.has_e2e_header()) {
         return TpResult::SEGMENTATION_FAILED;
     }

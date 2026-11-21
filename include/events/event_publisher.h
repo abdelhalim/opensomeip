@@ -17,6 +17,9 @@
 #include "event_types.h"
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
+#include "transport/endpoint.h"
+#include "transport/message_rejection.h"
+#include "transport/transport.h"
 
 #ifdef SOMEIP_STATIC_ALLOC
 #include "static_config.h"
@@ -38,13 +41,27 @@ class EventPublisherImpl;
  * to subscribed clients using the SOME/IP event mechanism.
  */
 class EventPublisher {
-public:
+   public:
     /**
      * @brief Constructor
      * @param service_id Service identifier
      * @param instance_id Service instance identifier
+     * @param interface_version Service major version stamped on success responses.
+     *        A request with a different version receives E_WRONG_INTERFACE_VERSION.
      */
-    EventPublisher(uint16_t service_id, uint16_t instance_id);
+    EventPublisher(uint16_t service_id, uint16_t instance_id, uint8_t interface_version = 0x01);
+
+    /**
+     * @brief Borrow an exclusive, stopped transport instead of creating UDP.
+     * @param service_id Service identifier offering these events.
+     * @param instance_id Service instance identifier.
+     * @param transport Must outlive this publisher; the publisher manages start/stop.
+     * @param interface_version Service major version stamped on success responses.
+     * @note Local binding and transport configuration belong to the supplied backend.
+     * @see transport::ITransport for the injected-transport lifecycle contract.
+     */
+    EventPublisher(uint16_t service_id, uint16_t instance_id, transport::ITransport& transport,
+                   uint8_t interface_version = 0x01);
 
     /**
      * @brief Destructor
@@ -69,10 +86,21 @@ public:
     void shutdown();
 
     /**
+     * @brief Result of the last transport start/stop (including failed-start cleanup).
+     * @return SUCCESS initially, otherwise the last lifecycle outcome; not a receive error.
+     * @note Safe to query during initialize/shutdown; object destruction must be serialized.
+     */
+    Result get_transport_result() const;
+
+    /**
      * @brief Register an event for publication
      *
      * @param config Event configuration
-     * @return true if registered successfully, false on error
+     * @return true if registered successfully, false on error.
+     *         A field with no getter, no setter, and no notifier is rejected.
+     *         Registering the same field notifier again replaces the previous
+     *         accessor ids and keeps the stored value.
+     *         A notifier field and a notifier-less field cannot share an id.
      */
     bool register_event(const EventConfig& config);
 
@@ -87,11 +115,34 @@ public:
     /**
      * @brief Update event configuration
      *
-     * @param event_id Event identifier
+     * @param event_id Registered event id to update
      * @param config New event configuration
-     * @return true if updated, false if event not found
+     * @return true if updated. false if that event is not registered, the new
+     *         field has no accessor, or a new accessor id belongs to another
+     *         field. Turning a field notifier off removes @p event_id and keeps
+     *         the stored value on the new getter or setter.
      */
     bool update_event_config(uint16_t event_id, const EventConfig& config);
+
+    /**
+     * @brief Configure the multicast threshold for an eventgroup
+     *
+     * Threshold 0 unicasts to each subscriber. Threshold 1 sends one
+     * multicast datagram and no unicast copy. A threshold above 1 unicasts
+     * while the active subscriber count is below it and multicasts at and
+     * above it. The multicast address and port come from @p config. Initial
+     * field events stay unicast. The library does not copy the datagram
+     * into other local processes.
+     *
+     * An unconfigured eventgroup stays at threshold 0. Returns false when a
+     * non-zero threshold has no IPv4 multicast address, the port is 0, or
+     * the eventgroup table is full.
+     *
+     * @implements REQ_TRANSPORT_012
+     * @param config Eventgroup threshold and multicast endpoint
+     * @return true if stored
+     */
+    bool configure_eventgroup(const EventgroupConfig& config);
 
     /**
      * @brief Publish an event notification
@@ -112,6 +163,23 @@ public:
     bool publish_field(uint16_t event_id, const platform::ByteBuffer& data);
 
     /**
+     * @brief Local UDP endpoint. The port is assigned after initialize when bound to 0.
+     */
+    transport::Endpoint get_local_endpoint() const;
+
+    /**
+     * @brief Adapt or reject an incoming field setter request.
+     *
+     * When unset, the requested bytes are stored unchanged and the response
+     * payload is that value (Message Type 0x80, Return Code E_OK).
+     * ACCEPTED stores @p accepted (which may differ from the request).
+     * REJECTED leaves the stored value unchanged and answers with Message Type
+     * ERROR, Return Code E_NOT_OK, and the current value.
+     * The hook must not throw. It is not called while the publisher lock is held.
+     */
+    void set_field_setter(FieldSetter setter);
+
+    /**
      * @brief Set the default client endpoint for subscriptions that don't
      *        provide an explicit endpoint (e.g. from SD-discovered addresses).
      * @param address Client IP address
@@ -128,7 +196,7 @@ public:
      * @return true if subscription handled, false on error
      */
     bool handle_subscription(uint16_t eventgroup_id, uint16_t client_id,
-                           const platform::Vector<EventFilter>& filters = {});
+                             const platform::Vector<EventFilter>& filters = {});
 
     /**
      * @brief Handle event subscription request with explicit TTL
@@ -144,9 +212,20 @@ public:
      * @param filters Optional filters for selective notifications
      * @return true if subscription handled, false on error
      */
-    bool handle_subscription(uint16_t eventgroup_id, uint16_t client_id,
-                           uint32_t ttl_seconds,
-                           const platform::Vector<EventFilter>& filters = {});
+    bool handle_subscription(uint16_t eventgroup_id, uint16_t client_id, uint32_t ttl_seconds,
+                             const platform::Vector<EventFilter>& filters = {});
+
+    /**
+     * @brief Record a subscription and optionally send cached field values.
+     *
+     * `send_initial_events == false` suppresses the initial field burst even
+     * when the client is new. `true` sends it even when the client is already
+     * subscribed. The overloads without this flag keep the legacy rule: send
+     * only for a new subscription.
+     */
+    bool handle_subscription(uint16_t eventgroup_id, uint16_t client_id, uint32_t ttl_seconds,
+                             const platform::Vector<EventFilter>& filters,
+                             bool send_initial_events);
 
     /**
      * @brief Handle event unsubscription
@@ -190,6 +269,14 @@ public:
     bool is_ready() const;
 
     /**
+     * @brief Observe structural rejections of incoming messages.
+     *
+     * @implements REQ_TRANSPORT_026
+     */
+    void set_message_rejection_handler(
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler);
+
+    /**
      * @brief Get publisher statistics
      *
      * @return Statistics about event publications
@@ -203,18 +290,31 @@ public:
     };
     Statistics get_statistics() const;
 
-private:
+   private:
 #ifdef SOMEIP_STATIC_ALLOC
+    /** @implements REQ_PLATFORM_STATIC_005 */
     alignas(alignof(std::max_align_t)) char impl_storage_[SOMEIP_PIMPL_EVENTPUB_SIZE];
-    EventPublisherImpl* impl() noexcept { return reinterpret_cast<EventPublisherImpl*>(impl_storage_); }
-    const EventPublisherImpl* impl() const noexcept { return reinterpret_cast<const EventPublisherImpl*>(impl_storage_); }
+    EventPublisherImpl* impl() noexcept
+    {
+        return reinterpret_cast<EventPublisherImpl*>(impl_storage_);
+    }
+    const EventPublisherImpl* impl() const noexcept
+    {
+        return reinterpret_cast<const EventPublisherImpl*>(impl_storage_);
+    }
 #else
     std::unique_ptr<EventPublisherImpl> impl_;
-    EventPublisherImpl* impl() noexcept { return impl_.get(); }
-    const EventPublisherImpl* impl() const noexcept { return impl_.get(); }
+    EventPublisherImpl* impl() noexcept
+    {
+        return impl_.get();
+    }
+    const EventPublisherImpl* impl() const noexcept
+    {
+        return impl_.get();
+    }
 #endif
 };
 
 }  // namespace someip::events
 
-#endif // SOMEIP_EVENTS_PUBLISHER_H
+#endif  // SOMEIP_EVENTS_PUBLISHER_H

@@ -42,10 +42,22 @@ struct E2EConfig {
     uint16_t data_id{0};
 
     /**
-     * @brief Offset from Return Code field (default 64 bits = 8 bytes)
-     * According to SOME/IP spec feat_req_someip_102
+     * @brief Spec Offset of the E2E header, stored in bits.
+     *
+     * Open SOME/IP feat_req_someip_102 names this field Offset and measures
+     * it in bits from the start of the Length-covered region (Request ID).
+     * Default 64 bits (8 bytes) places the header immediately after Return
+     * Code (wire byte 16).
+     *
+     * Byte-aligned values of at least 64 are placed by Message: the header
+     * starts at wire byte 8 + offset_bits/8, and the bytes between Return
+     * Code and that index are an unprotected prefix (not application
+     * payload). offset_bits < 64 or a non-multiple of 8 is
+     * Result::INVALID_ARGUMENT. A prefix larger than
+     * SOMEIP_MAX_E2E_PREFIX_SIZE is Result::NOT_IMPLEMENTED.
      */
-    uint32_t offset{8};
+    static constexpr uint32_t DEFAULT_OFFSET_BITS = 64;
+    uint32_t offset_bits{DEFAULT_OFFSET_BITS};
 
     /**
      * @brief Enable CRC calculation

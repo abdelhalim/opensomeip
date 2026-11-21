@@ -15,15 +15,24 @@
  * End-to-end integration tests for the static-allocation backend.
  *
  * Each test arms the malloc trap around protocol operations to prove
- * zero heap usage.  Pools are warmed up BEFORE arming so that lazy
- * first-use initialisation (if any) doesn't trip the trap.
+ * zero heap usage on the calling thread. Pools are warmed up BEFORE arming so
+ * that lazy first-use initialisation (if any) doesn't trip the trap.
  *
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_ARCH_008
+ * @tests REQ_PLATFORM_STATIC_005
  */
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <thread>
 
+#include "events/event_publisher.h"
+#include "events/event_subscriber.h"
 #include "malloc_trap.h"
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
@@ -31,20 +40,19 @@
 #include "platform/memory.h"
 #include "rpc/rpc_client.h"
 #include "rpc/rpc_server.h"
-#include "events/event_publisher.h"
-#include "events/event_subscriber.h"
 #include "sd/sd_client.h"
 #include "sd/sd_server.h"
 #include "someip/message.h"
 #include "someip/payload_view.h"
 #include "static_config.h"
-
-#include <cstring>
+#include "transport/endpoint.h"
+#include "transport/service_demux.h"
+#include "transport/udp_transport.h"
 
 namespace someip::platform {
 namespace {
 
-/// RAII guard: arms the malloc trap on construction, disarms on destruction.
+/// RAII guard: arms the calling thread's malloc trap, disarms on destruction.
 /// Prevents the trap from staying armed when ASSERT_* macros abort a test.
 class MallocTrapGuard {
 public:
@@ -52,6 +60,18 @@ public:
     ~MallocTrapGuard() { malloc_trap_disarm(); }
     MallocTrapGuard(const MallocTrapGuard&) = delete;
     MallocTrapGuard& operator=(const MallocTrapGuard&) = delete;
+};
+
+/// Empty transport listener for register_service() under the malloc trap.
+class NopListener : public transport::ITransportListener {
+public:
+    void on_message_received(MessagePtr /*message*/,
+                             const transport::Endpoint& /*sender*/) override
+    {
+    }
+    void on_connection_lost(const transport::Endpoint& /*endpoint*/) override {}
+    void on_connection_established(const transport::Endpoint& /*endpoint*/) override {}
+    void on_error(Result /*error*/) override {}
 };
 
 class StaticAllocEnv : public ::testing::Environment {
@@ -71,6 +91,125 @@ protected:
         if (slot) release_buffer(slot);
     }
 };
+
+/**
+ * @test_case TC_STATIC_INT_BORROWED_TRANSPORT
+ * @tests REQ_PAL_NOOP_HEAP_VERIFY, REQ_PLATFORM_STATIC_002, REQ_ARCH_003
+ */
+TEST_F(StaticAllocIntegrationTest, BorrowedTransportFacadeConstructionUnderTrap)
+{
+    const transport::Endpoint bind("0.0.0.0", 0);
+    transport::UdpTransport network(bind);
+
+    MallocTrapGuard guard;
+    {
+        rpc::RpcClient client(7, network);
+        EXPECT_EQ(client.get_transport_result(), Result::SUCCESS);
+    }
+    {
+        rpc::RpcServer server(0x1234, network);
+        EXPECT_EQ(server.get_transport_result(), Result::SUCCESS);
+    }
+    {
+        events::EventPublisher publisher(0x1234, 1, network);
+        EXPECT_EQ(publisher.get_transport_result(), Result::SUCCESS);
+    }
+    {
+        events::EventSubscriber subscriber(7, network);
+        EXPECT_EQ(subscriber.get_transport_result(), Result::SUCCESS);
+    }
+}
+
+/**
+ * @test_case TC_STATIC_INT_SYNC_CALLBACK_LIFETIME
+ * @tests REQ_PAL_NOOP_HEAP_VERIFY, REQ_PLATFORM_STATIC_002, REQ_ARCH_003
+ */
+TEST_F(StaticAllocIntegrationTest, SyncWaitRegistrationDoesNotAllocate)
+{
+    rpc::RpcClient client(7);
+    ASSERT_TRUE(client.initialize());
+    transport::UdpTransport peer(transport::Endpoint("127.0.0.1", 0));
+    ASSERT_EQ(peer.start(), Result::SUCCESS);
+    rpc::RpcTimeout timeout;
+    timeout.response_timeout = std::chrono::milliseconds(0);
+    {
+        MallocTrapGuard guard;
+        const auto result =
+            client.call_method_sync(0x1234, 0x0042, {}, peer.get_local_endpoint(), timeout);
+        EXPECT_EQ(result.result, rpc::RpcResult::TIMEOUT);
+    }
+    client.shutdown();
+    EXPECT_EQ(peer.stop(), Result::SUCCESS);
+}
+
+/**
+ * @test_case TC_STATIC_INT_TRAP_THREAD_SCOPE
+ * @tests REQ_PAL_NOOP_HEAP_VERIFY
+ */
+TEST_F(StaticAllocIntegrationTest, ArmedTrapDoesNotAffectAnotherThreadsAllocation)
+{
+    std::atomic<bool> allocate{false};
+    std::atomic<bool> complete{false};
+    bool worker_armed = true;
+    bool allocated = false;
+    bool caller_still_armed = false;
+    std::thread worker([&] {
+        while (!allocate.load()) {
+            std::this_thread::yield();
+        }
+        worker_armed = malloc_trap_is_armed();
+        void* (*volatile heap_allocate)(size_t) = &std::malloc;
+        void (*volatile heap_release)(void*) = &std::free;
+        void* memory = heap_allocate(64);
+        allocated = memory != nullptr;
+        heap_release(memory);
+        malloc_trap_arm();
+        malloc_trap_disarm();
+        complete.store(true);
+    });
+    {
+        MallocTrapGuard guard;
+        allocate.store(true);
+        while (!complete.load()) {
+            std::this_thread::yield();
+        }
+        caller_still_armed = malloc_trap_is_armed();
+    }
+    worker.join();
+    EXPECT_FALSE(worker_armed);
+    EXPECT_TRUE(allocated);
+    EXPECT_TRUE(caller_still_armed);
+    EXPECT_FALSE(malloc_trap_is_armed());
+}
+
+/**
+ * @test_case TC_STATIC_INT_TRAP_ARMED_ALLOC
+ * @tests REQ_PAL_NOOP_HEAP_VERIFY
+ */
+TEST(StaticAllocTrapDeathTest, ArmedCallingThreadStillTrapsHeapAllocation)
+{
+    EXPECT_DEATH_IF_SUPPORTED(
+        {
+            void* (*volatile heap_allocate)(size_t) = &std::malloc;
+            malloc_trap_arm();
+            static_cast<void>(heap_allocate(64));
+        },
+        "MALLOC TRAP:");
+}
+
+TEST(StaticAllocTrapDeathTest, ArmedWorkerThreadStillTrapsHeapAllocation)
+{
+    EXPECT_DEATH_IF_SUPPORTED(
+        {
+            std::thread worker([] {
+                void* (*volatile heap_allocate)(size_t) = &std::malloc;
+                malloc_trap_arm();
+                static_cast<void>(heap_allocate(64));
+            });
+            worker.join();
+        },
+        "MALLOC TRAP:");
+}
 
 /**
  * @test_case TC_STATIC_INT_ROUNDTRIP
@@ -234,6 +373,7 @@ TEST_F(StaticAllocIntegrationTest, FullStackUnderTrap) {
  * @test_case TC_STATIC_INT_RPCCLIENT_CTOR
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
  * @brief RpcClient construction + destruction uses no heap under static alloc
  */
 TEST_F(StaticAllocIntegrationTest, RpcClientConstructDestroyUnderTrap) {
@@ -245,6 +385,7 @@ TEST_F(StaticAllocIntegrationTest, RpcClientConstructDestroyUnderTrap) {
  * @test_case TC_STATIC_INT_RPCSERVER_CTOR
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
  * @brief RpcServer construction + destruction uses no heap under static alloc
  */
 TEST_F(StaticAllocIntegrationTest, RpcServerConstructDestroyUnderTrap) {
@@ -253,9 +394,30 @@ TEST_F(StaticAllocIntegrationTest, RpcServerConstructDestroyUnderTrap) {
 }
 
 /**
+ * @test_case TC_STATIC_INT_SERVICEDEMUX_REGISTER
+ * @tests REQ_PAL_NOOP_HEAP_VERIFY
+ * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
+ * @brief ServiceDemux construction and register_service uses no heap under static alloc
+ */
+TEST_F(StaticAllocIntegrationTest, ServiceDemuxRegisterUnderTrap) {
+    MallocTrapGuard guard;
+    {
+        // Default config: blocking=true, enable_tp=false under SOMEIP_STATIC_ALLOC.
+        const transport::UdpTransportConfig config;
+        transport::UdpTransport transport(transport::Endpoint("127.0.0.1", 0), config);
+        transport::ServiceDemux demux(transport);
+        NopListener listener;
+        ASSERT_EQ(demux.register_service(0x1234, listener), Result::SUCCESS);
+        ASSERT_EQ(demux.register_service(0x5678, listener), Result::SUCCESS);
+    }
+}
+
+/**
  * @test_case TC_STATIC_INT_EVENTPUB_CTOR
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
  * @brief EventPublisher construction + destruction uses no heap under static alloc
  */
 TEST_F(StaticAllocIntegrationTest, EventPublisherConstructDestroyUnderTrap) {
@@ -267,6 +429,7 @@ TEST_F(StaticAllocIntegrationTest, EventPublisherConstructDestroyUnderTrap) {
  * @test_case TC_STATIC_INT_EVENTSUB_CTOR
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
  * @brief EventSubscriber construction + destruction uses no heap under static alloc
  */
 TEST_F(StaticAllocIntegrationTest, EventSubscriberConstructDestroyUnderTrap) {
@@ -278,6 +441,7 @@ TEST_F(StaticAllocIntegrationTest, EventSubscriberConstructDestroyUnderTrap) {
  * @test_case TC_STATIC_INT_SDCLIENT_CTOR
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
  * @brief SdClient construction + destruction uses no heap under static alloc
  */
 TEST_F(StaticAllocIntegrationTest, SdClientConstructDestroyUnderTrap) {
@@ -289,6 +453,7 @@ TEST_F(StaticAllocIntegrationTest, SdClientConstructDestroyUnderTrap) {
  * @test_case TC_STATIC_INT_SDSERVER_CTOR
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @tests REQ_PLATFORM_STATIC_002
+ * @tests REQ_PLATFORM_STATIC_005
  * @brief SdServer construction + destruction uses no heap under static alloc
  */
 TEST_F(StaticAllocIntegrationTest, SdServerConstructDestroyUnderTrap) {
@@ -298,7 +463,7 @@ TEST_F(StaticAllocIntegrationTest, SdServerConstructDestroyUnderTrap) {
 
 /**
  * @test_case TC_STATIC_INT_PAYLOADVIEW
- * @tests REQ_API_PAYLOAD_VIEW
+ * @tests REQ_MSG_151
  * @tests REQ_PAL_NOOP_HEAP_VERIFY
  * @brief PayloadView operations under malloc trap prove zero-copy access
  */

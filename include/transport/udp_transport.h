@@ -14,7 +14,9 @@
 #ifndef SOMEIP_TRANSPORT_UDP_TRANSPORT_H
 #define SOMEIP_TRANSPORT_UDP_TRANSPORT_H
 
+#include "e2e/e2e_receive_policy.h"
 #include "transport/transport.h"
+#include "transport/multicast_transport.h"
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
 #include "platform/net.h"
@@ -43,21 +45,49 @@ struct UdpTransportConfig {
     bool reuse_address{true};               // Allow address reuse (SO_REUSEADDR)
     bool reuse_port{false};                 // Allow port reuse (SO_REUSEPORT) - for multicast
     bool enable_broadcast{false};           // Enable broadcast sending
-    platform::String<> multicast_interface;  // Interface for multicast (empty = INADDR_ANY)
+    /// Outgoing multicast interface and group membership. Empty uses the
+    /// default route. Applied when the socket starts, so a send does not
+    /// require joining that group.
+    platform::String<> multicast_interface;
     int multicast_ttl{1};                   // Multicast TTL (1 = local network only)
 
-    // SOME/IP spec recommends max 1400 bytes to avoid IP fragmentation.
-    // Set to 0 to disable this check. When enable_tp is true, messages whose
-    // payload exceeds TpConfig.max_segment_size are segmented instead of
-    // sent as a single datagram.
-    size_t max_message_size{1400};
+    /// When non-zero, join_multicast_group records this errno and returns
+    /// MULTICAST_ERROR without IP_ADD_MEMBERSHIP. Zero keeps the socket call.
+    /// Test seam so join failure does not depend on a host interface address.
+    int injected_multicast_join_errno{0};
+
+    /// Serialized SOME/IP message budget (16-byte header + payload).
+    /// The default fits a 1400-byte application payload. Set to 0 to leave
+    /// TpConfig::max_single_datagram_size unchanged. When enable_tp is true,
+    /// segmentation starts only when the serialized message exceeds this
+    /// budget. 16-byte alignment applies to TP segments, not to a message
+    /// that still fits in one datagram.
+    size_t max_message_size{tp::DEFAULT_SINGLE_DATAGRAM_SIZE};
 
 #ifdef SOMEIP_STATIC_ALLOC
+    /// Static builds leave TP off until the caller turns it on.
     bool enable_tp{false};
 #else
     bool enable_tp{true};
 #endif
     tp::TpConfig tp_config{};
+
+    // Filled before the transport is constructed. Receive only reads it.
+    // Default layout only (Offset 64, 12-byte header).
+    e2e::E2EReceiveTable e2e_receive{};
+};
+
+/**
+ * @brief Diagnostic context for the most recent multicast membership failure
+ *
+ * REQ_TRANSPORT_011_E01 requires the group address and interface to be recorded
+ * when a join fails. The project has no logging facility, so the context is
+ * exposed through the API instead of written to a log.
+ */
+struct MulticastError {
+    platform::String<> group_address;      ///< Multicast group the operation targeted
+    platform::String<> interface_address;  ///< Configured interface; empty when INADDR_ANY
+    int system_error{0};                   ///< Platform socket error captured at failure
 };
 
 /**
@@ -70,7 +100,7 @@ struct UdpTransportConfig {
  * - Blocking mode (default): More efficient, eliminates busy loops
  * - Non-blocking mode: Allows integration with event loops/polling
  */
-class UdpTransport : public ITransport {
+class UdpTransport : public ITransport, public IMulticastTransport {
 public:
     /**
      * @brief Constructor
@@ -110,10 +140,25 @@ public:
     Result start() override;
     Result stop() override;
     bool is_running() const override;
+    IMulticastTransport* multicast_transport() noexcept override { return this; }
 
     // Multicast support
-    Result join_multicast_group(const platform::String<>& multicast_address);
-    Result leave_multicast_group(const platform::String<>& multicast_address);
+    /**
+     * @brief Join a multicast group
+     *
+     * @return Result::SUCCESS on success, Result::MULTICAST_ERROR when the
+     *         membership operation fails. On failure the group and interface
+     *         are retrievable via last_multicast_error().
+     * @implements REQ_TRANSPORT_011_E01
+     */
+    Result join_multicast_group(const platform::String<>& multicast_address) override;
+    Result leave_multicast_group(const platform::String<>& multicast_address) override;
+
+    /**
+     * @brief Context of the most recent failed membership operation
+     * @return The failure context, or nullopt if the last membership op succeeded
+     */
+    [[nodiscard]] std::optional<MulticastError> last_multicast_error() const;
 
     // Disable copy and assignment
     UdpTransport(const UdpTransport&) = delete;
@@ -133,7 +178,8 @@ private:
     platform::Mutex queue_mutex_;
     platform::ConditionVariable queue_cv_;
 
-    platform::Mutex socket_mutex_;
+    mutable platform::Mutex socket_mutex_;
+    std::optional<MulticastError> last_multicast_error_;
 
     std::unique_ptr<tp::TpManager> tp_manager_;
 
@@ -145,13 +191,19 @@ private:
     Result bind_socket();
     Result configure_multicast(const Endpoint& endpoint);
     void receive_loop();
+    void notify_rejection(const MessageRejectionInfo& info);
     Result send_data(const platform::ByteBuffer& data, const Endpoint& endpoint);
+    void apply_multicast_send_options();
     Result receive_data(platform::ByteBuffer& data, Endpoint& sender, Endpoint& destination,
                        size_t& bytes_received);
     Result send_tp_segments(const Message& message, const Endpoint& endpoint);
     sockaddr_in create_sockaddr(const Endpoint& endpoint) const;
     Endpoint sockaddr_to_endpoint(const sockaddr_in& addr) const;
     bool is_multicast_address(const platform::String<>& address) const;
+    // Both require socket_mutex_ to be held by the caller.
+    void record_multicast_error(const platform::String<>& multicast_address,
+                                const platform::String<>& interface_address);
+    void clear_multicast_error();
 };
 
 }  // namespace someip::transport

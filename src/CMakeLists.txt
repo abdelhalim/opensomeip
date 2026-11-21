@@ -10,7 +10,11 @@ set(OPENSOMEIP_SOURCES
     transport/endpoint.cpp
     transport/udp_transport.cpp
     transport/tcp_transport.cpp
+    transport/service_demux.cpp
+    transport/event_driven_udp_transport.cpp
+    transport/event_driven_tcp_transport.cpp
     e2e/e2e_protection.cpp
+    e2e/e2e_receive.cpp
     e2e/e2e_header.cpp
     e2e/e2e_crc.cpp
     e2e/e2e_profile_registry.cpp
@@ -105,6 +109,15 @@ if(SOMEIP_USE_THREADX AND NOT SOMEIP_USE_STATIC_ALLOC)
         ${CMAKE_CURRENT_SOURCE_DIR}/platform/threadx/memory.cpp)
 endif()
 
+# E2E caps size std::array members of the public Message type in every
+# build. Forward them whenever the cache variable is set; the static-pool
+# list below does not run for the default allocator.
+foreach(_e2e_cap SOMEIP_MAX_E2E_HEADER_SIZE SOMEIP_MAX_E2E_PREFIX_SIZE)
+    if(DEFINED ${_e2e_cap})
+        target_compile_definitions(opensomeip PUBLIC ${_e2e_cap}=${${_e2e_cap}})
+    endif()
+endforeach()
+
 # Static allocation platform sources
 if(SOMEIP_USE_STATIC_ALLOC)
     target_sources(opensomeip PRIVATE
@@ -135,6 +148,7 @@ if(SOMEIP_USE_STATIC_ALLOC)
         SOMEIP_BYTE_POOL_LARGE_COUNT
         SOMEIP_BYTE_POOL_LARGE_SIZE
         SOMEIP_MAX_TP_SEGMENTS
+        SOMEIP_MAX_TCP_CONNECTIONS
         SOMEIP_MAX_TP_REASSEMBLY_SIZE
         SOMEIP_MAX_SD_OPTIONS
         SOMEIP_DEFAULT_MAP_CAPACITY
@@ -252,4 +266,12 @@ if(BUILD_SHARED_LIBS)
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
+endif()
+
+# Host unit tests delay outbound connect so get_connection_state() can
+# observe CONNECTING. Production (BUILD_TESTS=OFF, including the shared
+# package) and RTOS backends do not compile the setter or the sleep.
+if(BUILD_TESTS AND NOT SOMEIP_USE_FREERTOS AND NOT SOMEIP_USE_THREADX)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/transport/tcp_transport.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS SOMEIP_TCP_TEST_CONNECT_HOLD)
 endif()

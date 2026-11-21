@@ -15,6 +15,7 @@
 #define SOMEIP_TRANSPORT_TRANSPORT_H
 
 #include "transport/endpoint.h"
+#include "transport/message_rejection.h"
 #include "someip/message.h"
 #include "common/result.h"
 #include <memory>
@@ -74,15 +75,54 @@ public:
      */
     virtual void on_error(Result error) = 0;
 
+    /**
+     * @brief Called when a complete incoming PDU is structurally rejected.
+     *
+     * Default is a no-op so existing listeners remain source-compatible.
+     * Incomplete TCP frames and consumed Magic Cookies do not invoke this.
+     *
+     * @implements REQ_TRANSPORT_026
+     */
+    virtual void on_message_rejected(const MessageRejectionInfo& /*info*/) {}
+
 protected:
     ITransportListener() = default;
 };
+
+class IMulticastTransport;
 
 /**
  * @brief Transport interface
  *
  * This interface defines the contract for all transport implementations
  * (UDP, TCP, etc.) in the SOME/IP stack.
+ *
+ * RPC, event, and service-discovery facades may borrow an exclusive transport.
+ * Service discovery also requires IMulticastTransport, reported by
+ * multicast_transport() without RTTI. The borrowed transport
+ * must outlive the facade, be stopped and have no listener when initialize()
+ * is called, and
+ * must not be used by another facade or by the caller until shutdown returns.
+ * Construction does not register a listener. The facade manages start/stop
+ * and detaches its listener after stop() on shutdown or failed initialization.
+ * The running-state precondition is checked; absence of an existing listener
+ * is the caller's responsibility because this interface has no listener query.
+ *
+ * Injected implementations must not throw from lifecycle operations. stop()
+ * must quiesce callbacks and receive producers before returning, even on an
+ * error or after a failed start(). After a successfully started session is
+ * stopped, the facade discards queued messages. A failed start preserves the
+ * lender's queue. Draining requires receive_message()
+ * to be non-blocking and eventually return nullptr;
+ * the facade consumes and discards queued data, including on a borrowed backend.
+ * Resource cleanup failure can be reported separately from callback quiescence;
+ * if is_running() remains true, shutdown() may be called again to retry cleanup
+ * before reinitialization.
+ * Lifecycle calls must be serialized externally and must not
+ * be made from a transport/application callback. These overloads stay
+ * exclusive. Several handlers share one socket through ServiceDemux, which
+ * is the transport's only listener and selects a handler from the SOME/IP
+ * service id.
  */
 class ITransport {
 public:
@@ -123,13 +163,22 @@ public:
     [[nodiscard]] virtual Result connect(const Endpoint& endpoint) = 0;
 
     /**
-     * @brief Disconnect from endpoint (TCP only)
+     * @brief Disconnect (TCP)
+     *
+     * For TCP, this closes every connection the transport holds: a client
+     * closes its outbound peer, a server closes all accepted peers. Use
+     * TcpTransport::disconnect_peer() to close one server-side peer.
+     *
      * @return Result of the operation
      */
     [[nodiscard]] virtual Result disconnect() = 0;
 
     /**
      * @brief Check if connected
+     *
+     * For TCP, true when any peer is connected. Inspect individual peers
+     * with TcpTransport::is_peer_connected().
+     *
      * @return true if connected, false otherwise
      */
     virtual bool is_connected() const = 0;
@@ -183,6 +232,12 @@ public:
      * @return true if running, false otherwise
      */
     virtual bool is_running() const = 0;
+
+    /**
+     * @brief Multicast membership surface, when this transport has one.
+     * @return Null unless the concrete transport also implements IMulticastTransport.
+     */
+    virtual IMulticastTransport* multicast_transport() noexcept { return nullptr; }
 
 protected:
     ITransport() = default;

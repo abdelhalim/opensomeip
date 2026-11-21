@@ -56,6 +56,30 @@ make -j$(nproc)
 make test
 ```
 
+### Bazel
+
+CMake remains the source of truth for presets, RTOS ports, and packaging.
+The Bazel module builds the default host library (POSIX sockets, dynamic
+allocation, C API) and the C++ tests that the default host CMake build runs.
+GoogleTest is a dev dependency from the Bazel module registry, not a
+checked-in copy, so it does not enter the module graph of a downstream
+module that only links the library. Static-allocation tests and RTOS
+runtime tests are not part of this graph.
+
+`//:opensomeip` does not define `SOMEIP_TCP_TEST_CONNECT_HOLD`. External
+modules that link that target do not get the test hook, and connect is not
+delayed. CMake defines it only when `BUILD_TESTS` is on. The Bazel TCP
+handshake test links a private test-only library compiled with that
+definition. The hold defaults to zero until the test sets it.
+
+```bash
+bazel test //...
+```
+
+`.bazelversion` pins Bazel 8.8.2. Verified with that Bazel and Apple clang
+21.0.0 (`arm64-apple-darwin25.6.0`, clang-2100.0.123.102): `bazel test //...`
+ran 38 tests and all passed.
+
 ### Direct Compiler Build (Without CMake)
 
 ```bash
@@ -141,6 +165,17 @@ cmake --build . --config Release
 # Or with Ninja
 cmake .. -G Ninja
 ninja
+```
+
+### QNX Neutrino
+
+POSIX sockets via the existing host PAL. This is not a new RTOS backend, and it is not verified with an SDP in CI. Configuration needs `QNX_HOST` and `QNX_TARGET` from a sourced SDP 8.0.0 environment. This tree was not configured that way. See [QNX_PORT.md](QNX_PORT.md).
+
+```bash
+cmake -S . -B build/qnx-x86_64 \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/qnx-sdp.cmake \
+  -DBUILD_TESTS=OFF \
+  -DBUILD_EXAMPLES=OFF
 ```
 
 ### Embedded Systems
@@ -415,14 +450,19 @@ make test
 # Create release branch
 git checkout -b release/v1.0.0
 
-# Update version
-echo "1.0.0" > VERSION
+# Update VERSION, MODULE.bazel, the README, the RPM spec, and CHANGELOG together
+./scripts/bump_version.sh 1.0.0
+
+# Commit the bump before tagging. The release check compares the tag
+# with the version files at that commit.
+git add VERSION MODULE.bazel README.md packaging/opensomeip.spec CHANGELOG.md
+git commit -m "chore(release): bump version to 1.0.0"
 
 # Build release
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make package
 
-# Tag release
+# Tag the commit that contains the new version files.
 git tag v1.0.0
 git push origin v1.0.0
 ```

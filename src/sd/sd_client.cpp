@@ -25,8 +25,10 @@
 #include "someip/message.h"
 #include "someip/types.h"
 #include "transport/endpoint.h"
+#include "transport/multicast_transport.h"
 #include "transport/transport.h"
 #include "transport/udp_transport.h"
+#include "../transport/transport_session.h"
 
 #include <algorithm>
 #include <atomic>
@@ -64,18 +66,34 @@ class SdClientImpl : public transport::ITransportListener {
 public:
     explicit SdClientImpl(const SdConfig& config)
         : config_(config),
-          transport_(transport::Endpoint("0.0.0.0", config.multicast_port),
-                     make_sd_transport_config(config)),
+          transport_session_(transport::Endpoint("0.0.0.0", config.multicast_port),
+                             make_sd_transport_config(config)),
+          transport_(transport_session_.get()),
+          multicast_(transport_session_.multicast()),
           next_request_id_(1),
           running_(false),
           initial_wait_until_(std::chrono::steady_clock::now()) {
+    }
 
-        transport_.set_listener(this);
+    SdClientImpl(const SdConfig& config, transport::ITransport& transport)
+        : config_(config),
+          transport_session_(transport),
+          transport_(transport_session_.get()),
+          multicast_(transport_session_.multicast()),
+          next_request_id_(1),
+          running_(false),
+          initial_wait_until_(std::chrono::steady_clock::now()) {
     }
 
     ~SdClientImpl() override
     {
+#ifdef __cpp_exceptions
+        try {
+            shutdown();
+        } catch (...) {}  // NOLINT(bugprone-empty-catch) destructor must not throw
+#else
         shutdown();
+#endif
     }
 
     SdClientImpl(const SdClientImpl&) = delete;
@@ -89,12 +107,20 @@ public:
             return true;
         }
 
-        if (transport_.start() != Result::SUCCESS) {
+        // A borrowed transport must be able to join the SD multicast group.
+        if (multicast_ == nullptr) {
             return false;
         }
 
+        if (transport_session_.start(*this) != Result::SUCCESS) {
+            return false;
+        }
+
+        // Deliberately fail closed here, unlike SdServer. A client that cannot
+        // receive SD multicast cannot discover anything, and initialize()
+        // returning false is already an explicit, caller-visible failure.
         if (!join_multicast_group()) {
-            transport_.stop();
+            transport_session_.stop();
             return false;
         }
 
@@ -105,9 +131,33 @@ public:
         return true;
     }
 
+    /**
+     * @brief Aggregate local eventgroup multicast state
+     * @implements REQ_TRANSPORT_011_E01
+     */
+    MulticastState eventgroup_multicast_state() const {
+        platform::ScopedLock const lock(multicast_memberships_mutex_);
+        bool any_exhausted = membership_capacity_exhausted_;
+        for (const auto& entry : multicast_memberships_) {
+            const MulticastState s = entry.membership.state();
+            if (s == MulticastState::RETRYING) {
+                return MulticastState::RETRYING;
+            }
+            if (s == MulticastState::EXHAUSTED) {
+                any_exhausted = true;
+            }
+        }
+        return any_exhausted ? MulticastState::EXHAUSTED : MulticastState::JOINED;
+    }
+
     /** @implements REQ_SD_090, REQ_SD_091, REQ_SD_092, REQ_SD_093, REQ_SD_094 */
+    Result get_transport_result() const {
+        return transport_session_.result();
+    }
+
     void shutdown() {
         if (!running_) {
+            transport_session_.stop();
             return;
         }
 
@@ -120,9 +170,15 @@ public:
             service_subscriptions_.clear();
         }
 
+        {
+            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+            eventgroup_subscriptions_.clear();
+        }
+        clear_all_multicast_memberships();
+
         leave_multicast_group();
 
-        transport_.stop();
+        transport_session_.stop();
     }
 
     /** @implements REQ_SD_100, REQ_SD_101, REQ_SD_102, REQ_SD_103, REQ_SD_127, REQ_SD_131, REQ_SD_210, REQ_SD_211, REQ_SD_212 */
@@ -215,8 +271,8 @@ public:
         return service_subscriptions_.erase(service_id) > 0;
     }
 
-    /** @implements REQ_SD_120_E01, REQ_SD_123_E01, REQ_SD_211, REQ_SD_230, REQ_SD_231, REQ_SD_232, REQ_SD_234, REQ_SD_240, REQ_SD_241, REQ_SD_270, REQ_SD_818
-     *  @satisfies feat_req_someipsd_818
+    /** @implements REQ_SD_120_E01, REQ_SD_123_E01, REQ_SD_211, REQ_SD_230, REQ_SD_231, REQ_SD_232, REQ_SD_234, REQ_SD_240, REQ_SD_241, REQ_SD_270, REQ_SD_818, REQ_SD_331
+     *  @satisfies feat_req_someipsd_818, feat_req_someipsd_322, feat_req_someipsd_1191, feat_req_someipsd_1192
      */
     bool subscribe_eventgroup(uint16_t service_id, uint16_t instance_id, uint16_t eventgroup_id) {
         if (!running_) {
@@ -232,9 +288,22 @@ public:
                              (static_cast<uint64_t>(instance_id) << 16U) |
                              eventgroup_id;
 
+        bool peer_explicit = false;
+        {
+            platform::ScopedLock const lock(available_services_mutex_);
+            const auto cached = cached_services_.find(make_service_key(service_id, instance_id));
+            if (cached != cached_services_.end()) {
+                peer_explicit = cached->second.explicit_initial_data;
+            }
+        }
+
+        bool request_initial = true;
+        bool legacy_missed_ack = false;
         {
             platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
-            if (eventgroup_subscriptions_.size() >= eventgroup_subscriptions_.max_size() &&
+            // Cap at membership bound in both static and dynamic builds so an
+            // admitted subscription cannot outgrow multicast_memberships_.
+            if (eventgroup_subscriptions_.size() >= MAX_MULTICAST_MEMBERSHIPS &&
                 eventgroup_subscriptions_.find(key) == eventgroup_subscriptions_.end()) {
                 return false;
             }
@@ -243,7 +312,29 @@ public:
             sub.instance_id = instance_id;
             sub.eventgroup_id = eventgroup_id;
             sub.major_version = 0x01;
+            sub.ttl_seconds = 3600;
             sub.state = SubscriptionState::PENDING_ACK;
+            // Preserve prior multicast ownership across replay / resubscribe so
+            // a later ACK does not double-acquire the same group.
+            const auto existing = eventgroup_subscriptions_.find(key);
+            if (existing != eventgroup_subscriptions_.end()) {
+                sub.multicast_group = existing->second.multicast_group;
+                const auto& prior = existing->second;
+                const bool ttl_alive = prior.ttl_seconds > 0 &&
+                    (std::chrono::steady_clock::now() - prior.timestamp) <
+                        std::chrono::seconds(prior.ttl_seconds);
+                // An active subscription is not asked for initial events again.
+                // Pending, rejected, requested (including post-reboot), and
+                // expired subscriptions do request them.
+                if (prior.state == SubscriptionState::SUBSCRIBED && ttl_alive) {
+                    request_initial = false;
+                } else if (prior.state == SubscriptionState::PENDING_ACK && !peer_explicit) {
+                    // A legacy server ignores the Initial Data Requested bit and
+                    // treats a repeated Subscribe as a renewal. Stop + Subscribe
+                    // in the same datagram makes the repetition a new subscription.
+                    legacy_missed_ack = true;
+                }
+            }
             eventgroup_subscriptions_[key] = sub;
         }
 
@@ -253,12 +344,30 @@ public:
         subscribe_entry.set_eventgroup_id(eventgroup_id);
         subscribe_entry.set_major_version(0x01);
         subscribe_entry.set_ttl(3600);
+        subscribe_entry.set_initial_data_requested(request_initial);
 
         subscribe_entry.set_index1(0);
         subscribe_entry.set_num_opts1(1);
 
         SdMessage sd_message;
-        sd_message.add_entry(std::move(subscribe_entry));
+        if (legacy_missed_ack) {
+            EventGroupEntry stop_entry(EntryType::STOP_SUBSCRIBE_EVENTGROUP);
+            stop_entry.set_service_id(service_id);
+            stop_entry.set_instance_id(instance_id);
+            stop_entry.set_eventgroup_id(eventgroup_id);
+            stop_entry.set_major_version(0x01);
+            stop_entry.set_ttl(0);
+            stop_entry.set_index1(0);
+            stop_entry.set_num_opts1(1);
+            if (!sd_message.add_entry(std::move(stop_entry))) {
+                erase_eventgroup_subscription(key);
+                return false;
+            }
+        }
+        if (!sd_message.add_entry(std::move(subscribe_entry))) {
+            erase_eventgroup_subscription(key);
+            return false;
+        }
 
         IPv4EndpointOption endpoint_option;
         endpoint_option.set_ipv4_address_from_string(config_.unicast_address);
@@ -268,15 +377,13 @@ public:
 
         const uint16_t session_id = stamp_unicast_tx(sd_message, sd_unicast.get_address());
         if (session_id == 0) {
-            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
-            eventgroup_subscriptions_.erase(key);
+            erase_eventgroup_subscription(key);
             return false;
         }
 
         auto serialized = sd_message.serialize();
         if (serialized.empty()) {
-            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
-            eventgroup_subscriptions_.erase(key);
+            erase_eventgroup_subscription(key);
             return false;
         }
 
@@ -288,8 +395,7 @@ public:
         someip_message.set_payload(std::move(serialized));
 
         if (transport_.send_message(someip_message, sd_unicast) != Result::SUCCESS) {
-            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
-            eventgroup_subscriptions_.erase(key);
+            erase_eventgroup_subscription(key);
             return false;
         }
 
@@ -339,11 +445,21 @@ public:
         const bool sent = transport_.send_message(someip_message, sd_unicast) == Result::SUCCESS;
 
         if (sent) {
-            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
-            const uint64_t key = (static_cast<uint64_t>(service_id) << 32U) |
-                                 (static_cast<uint64_t>(instance_id) << 16U) |
-                                 eventgroup_id;
-            eventgroup_subscriptions_.erase(key);
+            platform::String<> group;
+            {
+                platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+                const uint64_t key = (static_cast<uint64_t>(service_id) << 32U) |
+                                     (static_cast<uint64_t>(instance_id) << 16U) |
+                                     eventgroup_id;
+                const auto it = eventgroup_subscriptions_.find(key);
+                if (it != eventgroup_subscriptions_.end()) {
+                    group = it->second.multicast_group;
+                    eventgroup_subscriptions_.erase(it);
+                }
+            }
+            if (!group.empty()) {
+                release_multicast_membership(group);
+            }
         }
         return sent;
     }
@@ -401,7 +517,164 @@ private:
         std::chrono::steady_clock::time_point received_time;
         uint16_t last_session_id{0};
         bool reboot_flag{false};
+        /// Last SD message from this server advertised explicit initial-data control.
+        bool explicit_initial_data{false};
     };
+
+    /// One reception stream (multicast or unicast) on an SD endpoint.
+    struct SdSessionObservation {
+        bool seen{false};
+        uint16_t last_session_id{0};
+        bool reboot_flag{false};
+    };
+
+    /// Reboot state for one SD endpoint. The two streams have independent
+    /// session counters, so they must not share an observation.
+    struct RebootChannel {
+        SdSessionObservation unicast;
+        SdSessionObservation multicast;
+    };
+
+    static platform::String<> sd_channel_key(const platform::String<>& address, uint16_t port) {
+        platform::String<> key = address;
+        key.push_back(':');
+        uint16_t place = 10000;
+        bool started = false;
+        while (place > 0U) {
+            const auto digit = static_cast<uint16_t>(port / place);
+            if (digit != 0U || started || place == 1U) {
+                key.push_back(static_cast<char>('0' + static_cast<int>(digit)));
+                started = true;
+            }
+            port = static_cast<uint16_t>(port % place);
+            place = static_cast<uint16_t>(place / 10U);
+        }
+        return key;
+    }
+
+    /** Drop reboot channels that no cached offer still names. Caller holds available_services_mutex_. */
+    void drop_unreferenced_reboot_channels() {
+        platform::Vector<platform::String<>, 32> drop;
+        for (const auto& channel : reboot_channels_) {
+            bool referenced = false;
+            for (const auto& endpoint : sd_unicast_endpoints_) {
+                if (sd_channel_key(endpoint.second.get_address(), endpoint.second.get_port()) ==
+                    channel.first) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced && drop.size() < drop.max_size()) {
+                drop.push_back(channel.first);
+            }
+        }
+        for (const auto& key : drop) {
+            reboot_channels_.erase(key);
+        }
+    }
+
+    /**
+     * @brief Drop every cached offer that still names this SD endpoint.
+     *
+     * Caller holds available_services_mutex_. The stored unicast address stays
+     * until replay finishes; the caller then drops it so a later offer can
+     * reuse the slot.
+     *
+     * @implements REQ_SD_171
+     * @satisfies feat_req_someipsd_764, feat_req_someipsd_765, feat_req_someipsd_872
+     */
+    void take_cached_services_for_channel(const transport::Endpoint& peer,
+                                          platform::Vector<ServiceInstance, 32>& removed) {
+        const platform::String<> channel = sd_channel_key(peer.get_address(), peer.get_port());
+        // Match sd_unicast_endpoints_, not the overridable default vector capacity.
+        platform::Vector<uint64_t, 32> keys;
+        for (const auto& endpoint : sd_unicast_endpoints_) {
+            if (sd_channel_key(endpoint.second.get_address(), endpoint.second.get_port()) !=
+                channel) {
+                continue;
+            }
+            if (keys.size() >= keys.max_size()) {
+                break;
+            }
+            keys.push_back(endpoint.first);
+        }
+
+        for (const uint64_t key : keys) {
+            ServiceInstance instance(static_cast<uint16_t>(key >> 16U),
+                                     static_cast<uint16_t>(key & 0xFFFFU));
+            const auto cached = cached_services_.find(key);
+            if (cached != cached_services_.end()) {
+                instance = cached->second.instance;
+                cached_services_.erase(key);
+            }
+            const auto rm_it =
+                std::remove_if(available_services_.begin(), available_services_.end(),
+                               [&](const ServiceInstance& svc) {
+                                   return svc.service_id == instance.service_id &&
+                                          svc.instance_id == instance.instance_id;
+                               });
+            available_services_.erase(rm_it, available_services_.end());
+            if (removed.size() < removed.max_size()) {
+                removed.push_back(instance);
+            }
+        }
+    }
+
+    /**
+     * @brief True when this datagram arrived on the SD multicast group.
+     *
+     * An empty destination means the stack could not report it. Those
+     * datagrams share the unicast observation.
+     */
+    bool received_via_multicast(const transport::Endpoint& destination) const {
+        if (destination.get_address().empty()) {
+            return false;
+        }
+        return destination.is_multicast() ||
+               destination.get_address() == config_.multicast_address;
+    }
+
+    /** @implements REQ_SD_1084, REQ_SD_311
+     *  @satisfies feat_req_someipsd_1084 */
+    bool note_reboot_channel(const transport::Endpoint& peer, uint16_t session, bool reboot_flag,
+                             bool via_multicast) {
+        const platform::String<> key = sd_channel_key(peer.get_address(), peer.get_port());
+        const auto it = reboot_channels_.find(key);
+        if (it == reboot_channels_.end()) {
+            if (reboot_channels_.size() >= reboot_channels_.max_size()) {
+                drop_unreferenced_reboot_channels();
+            }
+            if (reboot_channels_.size() >= reboot_channels_.max_size()) {
+                return false;
+            }
+            RebootChannel created;
+            SdSessionObservation& slot = via_multicast ? created.multicast : created.unicast;
+            slot.seen = true;
+            slot.last_session_id = session;
+            slot.reboot_flag = reboot_flag;
+            reboot_channels_[key] = created;
+            return false;
+        }
+
+        SdSessionObservation& slot = via_multicast ? it->second.multicast : it->second.unicast;
+        SdSessionObservation& other = via_multicast ? it->second.unicast : it->second.multicast;
+        if (!slot.seen) {
+            slot.seen = true;
+            slot.last_session_id = session;
+            slot.reboot_flag = reboot_flag;
+            return false;
+        }
+        const bool detected = sd_reboot_detected(
+            true, slot.reboot_flag, slot.last_session_id, reboot_flag, session);
+        slot.last_session_id = session;
+        slot.reboot_flag = reboot_flag;
+        if (detected) {
+            // This reboot already clears the peer. The other stream's next
+            // datagram is the first observation after that, not a second clear.
+            other = SdSessionObservation{};
+        }
+        return detected;
+    }
 
     void start_maintenance_loop() {
         if (maintenance_thread_ && maintenance_thread_->joinable()) {
@@ -414,6 +687,7 @@ private:
                 flush_pending_finds();
                 process_find_timeouts();
                 process_ttl_expiry();
+                retry_pending_multicast_joins();
             }
         });
     }
@@ -491,16 +765,167 @@ private:
         return (static_cast<uint64_t>(service_id) << 16U) | instance_id;
     }
 
+    MulticastRejoinConfig rejoin_config() const {
+        MulticastRejoinConfig cfg;
+        cfg.max_attempts = config_.multicast_rejoin_max_attempts;
+        cfg.interval = config_.multicast_rejoin_interval;
+        return cfg;
+    }
+
     bool join_multicast_group() {
-        return transport_.join_multicast_group(config_.multicast_address) == Result::SUCCESS;
+        return join_group(config_.multicast_address) == Result::SUCCESS;
     }
 
     void leave_multicast_group() {
-        transport_.leave_multicast_group(config_.multicast_address);
+        (void)leave_group(config_.multicast_address);
+    }
+
+    Result join_group(const platform::String<>& group) {
+        if (multicast_ == nullptr) {
+            return Result::NOT_IMPLEMENTED;
+        }
+        return multicast_->join_multicast_group(group);
+    }
+
+    Result leave_group(const platform::String<>& group) {
+        if (multicast_ == nullptr) {
+            return Result::NOT_IMPLEMENTED;
+        }
+        return multicast_->leave_multicast_group(group);
+    }
+
+    struct OwnedMulticastMembership {
+        platform::String<> group;
+        MulticastMembership membership;
+        uint8_t owner_count{0};
+    };
+
+    // Bound equals max eventgroup subscriptions so a peer cannot grow membership
+    // tracking beyond what subscribe_eventgroup already admits.
+    static constexpr size_t MAX_MULTICAST_MEMBERSHIPS = 32;
+
+    /**
+     * @brief Erase a subscription record and release any multicast ownership it held.
+     */
+    void erase_eventgroup_subscription(uint64_t key) {
+        platform::String<> group;
+        {
+            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+            const auto it = eventgroup_subscriptions_.find(key);
+            if (it == eventgroup_subscriptions_.end()) {
+                return;
+            }
+            group = it->second.multicast_group;
+            eventgroup_subscriptions_.erase(it);
+        }
+        if (!group.empty()) {
+            release_multicast_membership(group);
+        }
+    }
+
+    OwnedMulticastMembership* find_membership_unlocked(const platform::String<>& group) {
+        for (auto& entry : multicast_memberships_) {
+            if (entry.group == group) {
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Acquire ownership of a group and attempt join; bounded capacity.
+     * @implements REQ_TRANSPORT_011_E01, REQ_TRANSPORT_011_E03
+     */
+    void acquire_multicast_membership(const platform::String<>& group) {
+        platform::ScopedLock const lock(multicast_memberships_mutex_);
+        OwnedMulticastMembership* entry = find_membership_unlocked(group);
+        if (entry == nullptr) {
+            if (multicast_memberships_.size() >= MAX_MULTICAST_MEMBERSHIPS) {
+                // Bound equals max eventgroup subscriptions; never grow unbounded.
+                membership_capacity_exhausted_ = true;
+                return;
+            }
+            OwnedMulticastMembership created;
+            created.group = group;
+            created.owner_count = 1;
+            multicast_memberships_.push_back(created);
+            entry = &multicast_memberships_.back();
+        } else {
+            ++entry->owner_count;
+            if (entry->membership.state() == MulticastState::JOINED) {
+                return;
+            }
+            if (entry->membership.is_retrying() ||
+                entry->membership.state() == MulticastState::EXHAUSTED) {
+                // Already tracked; do not reset attempt budget on duplicate owners.
+                return;
+            }
+        }
+
+        if (join_group(group) == Result::SUCCESS) {
+            entry->membership.note_join_success();
+        } else {
+            entry->membership.note_join_failure(rejoin_config(),
+                                                MulticastMembership::clock::now());
+        }
+    }
+
+    /**
+     * @brief Release one owner; leave and cancel when the last owner unsubscribes.
+     * @implements REQ_TRANSPORT_011_E03
+     */
+    void release_multicast_membership(const platform::String<>& group) {
+        platform::ScopedLock const lock(multicast_memberships_mutex_);
+        for (auto it = multicast_memberships_.begin(); it != multicast_memberships_.end(); ++it) {
+            if (it->group != group) {
+                continue;
+            }
+            if (it->owner_count > 0) {
+                --it->owner_count;
+            }
+            if (it->owner_count == 0) {
+                (void)leave_group(group);
+                it->membership.cancel();
+                multicast_memberships_.erase(it);
+                if (multicast_memberships_.size() < MAX_MULTICAST_MEMBERSHIPS) {
+                    membership_capacity_exhausted_ = false;
+                }
+            }
+            return;
+        }
+    }
+
+    void clear_all_multicast_memberships() {
+        platform::ScopedLock const lock(multicast_memberships_mutex_);
+        for (auto& entry : multicast_memberships_) {
+            (void)leave_group(entry.group);
+            entry.membership.cancel();
+        }
+        multicast_memberships_.clear();
+        membership_capacity_exhausted_ = false;
+    }
+
+    /** @implements REQ_TRANSPORT_011_E03 */
+    void retry_pending_multicast_joins() {
+        platform::ScopedLock const lock(multicast_memberships_mutex_);
+        const auto now = MulticastMembership::clock::now();
+        const auto cfg = rejoin_config();
+        for (auto& entry : multicast_memberships_) {
+            if (!entry.membership.due(now)) {
+                continue;
+            }
+            const bool ok = join_group(entry.group) == Result::SUCCESS;
+            entry.membership.note_rejoin_result(ok, cfg, now);
+        }
     }
 
     /** @implements REQ_SD_116_E01, REQ_SD_119, REQ_SD_120, REQ_SD_120_E01, REQ_SD_123_E01, REQ_SD_311, REQ_SD_331 */
     void on_message_received(MessagePtr message, const transport::Endpoint& sender) override {
+        on_message_received(message, sender, transport::Endpoint("", 0));
+    }
+
+    void on_message_received(const MessagePtr& message, const transport::Endpoint& sender,
+                            const transport::Endpoint& destination) override {
         // Check if this is an SD message (service ID 0xFFFF)
         if (message->get_service_id() != 0xFFFF) {
             return;
@@ -512,7 +937,7 @@ private:
         }
         sd_message.set_session_id(message->get_session_id());
 
-        process_sd_entries(sd_message, sender);
+        process_sd_entries(sd_message, sender, destination);
     }
 
     void on_connection_lost(const transport::Endpoint& /*endpoint*/) override {
@@ -527,8 +952,41 @@ private:
         // TODO: Handle transport errors
     }
 
-    /** @implements REQ_SD_119, REQ_SD_120, REQ_SD_311, REQ_SD_331 */
-    void process_sd_entries(const SdMessage& message, const transport::Endpoint& sender) {
+    /** @implements REQ_SD_119, REQ_SD_120, REQ_SD_171, REQ_SD_311, REQ_SD_331, REQ_SD_1084 */
+    void process_sd_entries(const SdMessage& message, const transport::Endpoint& sender,
+                           const transport::Endpoint& destination) {
+        // Session and reboot flag are message-scoped. Recording them once avoids
+        // a second offer in the same datagram looking like a session reuse.
+        // The same record clears every cached service on that endpoint, so a
+        // SubscribeAck or a later offer does not have to rediscover the reboot.
+        platform::String<> sd_address;
+        uint16_t sd_port = 0;
+        transport::Endpoint sd_peer = sender;
+        if (message.ipv4_sd_endpoint(sd_address, sd_port)) {
+            sd_peer = transport::Endpoint(sd_address, sd_port);
+        }
+        bool channel_rebooted = false;
+        platform::Vector<ServiceInstance, 32> rebooted_services;
+        {
+            platform::ScopedLock const lock(available_services_mutex_);
+            channel_rebooted = note_reboot_channel(
+                sd_peer, message.get_session_id(), message.get_reboot_flag(),
+                received_via_multicast(destination));
+            if (channel_rebooted) {
+                take_cached_services_for_channel(sd_peer, rebooted_services);
+            }
+        }
+        for (const auto& instance : rebooted_services) {
+            handle_remote_reboot(instance);
+        }
+        if (channel_rebooted) {
+            platform::ScopedLock const lock(available_services_mutex_);
+            for (const auto& instance : rebooted_services) {
+                sd_unicast_endpoints_.erase(
+                    make_service_key(instance.service_id, instance.instance_id));
+            }
+        }
+
         for (const auto& entry_var : message.get_entries()) {
             const SdEntry* entry = get_entry_ptr(entry_var);
             switch (entry->get_type()) {
@@ -537,7 +995,21 @@ private:
                         if (entry->get_ttl() == 0) {
                             handle_service_stop_offer(*se);
                         } else {
-                            handle_service_offer(*se, message, sender);
+                            // Services already cleared above must not reboot again.
+                            // An offer whose cache names a different endpoint still
+                            // follows this datagram's channel.
+                            bool already_rebooted = false;
+                            if (channel_rebooted) {
+                                for (const auto& inst : rebooted_services) {
+                                    if (inst.service_id == se->get_service_id() &&
+                                        inst.instance_id == se->get_instance_id()) {
+                                        already_rebooted = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            handle_service_offer(*se, message, sd_peer,
+                                                 channel_rebooted && !already_rebooted);
                         }
                     }
                     break;
@@ -552,9 +1024,10 @@ private:
         }
     }
 
-    /** @implements REQ_SD_160, REQ_SD_161, REQ_SD_211, REQ_SD_230, REQ_SD_234, REQ_SD_240, REQ_SD_346, REQ_SD_348 */
+    /** @implements REQ_SD_160, REQ_SD_161, REQ_SD_211, REQ_SD_230, REQ_SD_234, REQ_SD_240, REQ_SD_346, REQ_SD_348, REQ_SD_1084, REQ_SD_343
+     *  @satisfies feat_req_someipsd_1084, feat_req_someipsd_1114 */
     void handle_service_offer(const ServiceEntry& entry, const SdMessage& message,
-                             const transport::Endpoint& sender) {
+                             const transport::Endpoint& sd_peer, bool rebooted) {
         ServiceInstance instance;
         instance.service_id = entry.get_service_id();
         instance.instance_id = entry.get_instance_id();
@@ -562,41 +1035,33 @@ private:
         instance.minor_version = entry.get_minor_version();
         instance.ttl_seconds = entry.get_ttl();
 
-        // Extract endpoint information from options
+        // Extract the application endpoint. An entry that references the IPv4
+        // SD Endpoint Option is ignored for this address; 0x24 is not a service port.
         const auto& options = message.get_options();
         uint8_t const index1 = entry.get_index1();
         uint8_t const run1 = entry.get_num_opts1();
 
-        for (uint8_t i = 0; i < run1 && (index1 + i) < options.size(); ++i) {
-            const auto& option_var = options[index1 + i];
-            if (const auto* ep = std::get_if<IPv4EndpointOption>(&option_var)) {
-                instance.ip_address = ep->get_ipv4_address_string();
-                instance.port = ep->get_port();
-                instance.protocol = ep->get_protocol();
-                break;  // Found the endpoint option
+        if (!message.entry_references_ipv4_sd_endpoint(entry)) {
+            for (uint8_t i = 0; i < run1 && (index1 + i) < options.size(); ++i) {
+                const auto& option_var = options[index1 + i];
+                if (const auto* ep = std::get_if<IPv4EndpointOption>(&option_var)) {
+                    instance.ip_address = ep->get_ipv4_address_string();
+                    instance.port = ep->get_port();
+                    instance.protocol = ep->get_protocol();
+                    break;  // Found the endpoint option
+                }
             }
         }
 
-        bool rebooted = false;
         {
             platform::ScopedLock const lock(available_services_mutex_);
             const uint64_t key = make_service_key(instance.service_id, instance.instance_id);
-            // Offering ECU SD unicast is the source of the Offer datagram.
             if (sd_unicast_endpoints_.size() < sd_unicast_endpoints_.max_size() ||
                 sd_unicast_endpoints_.find(key) != sd_unicast_endpoints_.end()) {
-                sd_unicast_endpoints_[key] = transport::Endpoint(sender.get_address(), sender.get_port());
+                sd_unicast_endpoints_[key] = sd_peer;
             }
             const uint16_t incoming_session = message.get_session_id();
             const bool incoming_reboot_flag = message.get_reboot_flag();
-
-            auto cache_it = cached_services_.find(key);
-            if (cache_it != cached_services_.end()) {
-                const auto& prev = cache_it->second;
-                if (incoming_reboot_flag != prev.reboot_flag ||
-                    (incoming_session < prev.last_session_id && incoming_reboot_flag)) {
-                    rebooted = true;
-                }
-            }
 
             if (rebooted) {
                 const auto rm_it = std::remove_if(
@@ -628,7 +1093,8 @@ private:
                     instance,
                     std::chrono::steady_clock::now(),
                     incoming_session,
-                    incoming_reboot_flag
+                    incoming_reboot_flag,
+                    message.explicit_initial_data_control()
                 };
             }
         }
@@ -703,7 +1169,9 @@ private:
     }
 
     SdConfig config_;
-    transport::UdpTransport transport_;
+    transport::detail::TransportSession transport_session_;
+    transport::ITransport& transport_;
+    transport::IMulticastTransport* multicast_;
 
     platform::UnorderedMap<uint16_t, ServiceSubscription, 32> service_subscriptions_;
     mutable platform::Mutex subscriptions_mutex_;
@@ -723,11 +1191,16 @@ private:
     platform::UnorderedMap<uint64_t, EventGroupSubscription, 32> eventgroup_subscriptions_;
     mutable platform::Mutex eventgroup_subscriptions_mutex_;
 
+    platform::Vector<OwnedMulticastMembership, MAX_MULTICAST_MEMBERSHIPS> multicast_memberships_;
+    mutable platform::Mutex multicast_memberships_mutex_;
+    bool membership_capacity_exhausted_{false};
+
     SdSessionIdCounter multicast_session_id_;
     platform::UnorderedMap<platform::String<>, SdSessionIdCounter, 16> unicast_session_ids_;
     mutable platform::Mutex session_id_mutex_;
 
     platform::UnorderedMap<uint64_t, transport::Endpoint, 32> sd_unicast_endpoints_;
+    platform::UnorderedMap<platform::String<>, RebootChannel, 32> reboot_channels_;
     platform::Vector<Message> pending_find_messages_;
     std::chrono::steady_clock::time_point initial_wait_until_;
 
@@ -782,11 +1255,20 @@ private:
 
     /** @implements REQ_SD_119, REQ_SD_120 */
     void handle_subscribe_ack_nack(const EventGroupEntry& entry, const SdMessage& message) {
+        {
+            platform::ScopedLock const lock(available_services_mutex_);
+            const auto cached = cached_services_.find(
+                make_service_key(entry.get_service_id(), entry.get_instance_id()));
+            if (cached != cached_services_.end()) {
+                cached->second.explicit_initial_data = message.explicit_initial_data_control();
+            }
+        }
         const uint64_t key = (static_cast<uint64_t>(entry.get_service_id()) << 32U) |
                              (static_cast<uint64_t>(entry.get_instance_id()) << 16U) |
                              entry.get_eventgroup_id();
 
         const bool accepted = entry.get_ttl() > 0;
+        platform::String<> rejected_group;
         {
             platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
             auto it = eventgroup_subscriptions_.find(key);
@@ -795,19 +1277,80 @@ private:
             }
             it->second.state = accepted ? SubscriptionState::SUBSCRIBED
                                         : SubscriptionState::REJECTED;
+            if (!accepted) {
+                rejected_group = it->second.multicast_group;
+                it->second.multicast_group.clear();
+            }
         }
 
         if (!accepted) {
+            if (!rejected_group.empty()) {
+                release_multicast_membership(rejected_group);
+            }
             return;
         }
 
+        // Peer acceptance is recorded above and is independent of local membership.
+        // A failed join must not look like delivery-ready success; ownership is
+        // tied to the subscription so pending state cannot outlive unsubscribe.
+        // Reconcile any group preserved across replay with the ACK: a multicast
+        // option replaces ownership, while a unicast ACK (no multicast option)
+        // must release the prior group so retries cannot outlive the delivery mode.
         const uint8_t index1 = entry.get_index1();
         const uint8_t run1 = entry.get_num_opts1();
         const auto& options = message.get_options();
         for (uint8_t i = 0; i < run1 && (index1 + i) < options.size(); ++i) {
             if (const auto* mc = std::get_if<IPv4MulticastOption>(&options[index1 + i])) {
-                static_cast<void>(transport_.join_multicast_group(mc->get_ipv4_address_string()));
+                const auto group = mc->get_ipv4_address_string();
+                platform::String<> previous_group;
+                {
+                    platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+                    auto it = eventgroup_subscriptions_.find(key);
+                    if (it == eventgroup_subscriptions_.end()) {
+                        return;
+                    }
+                    previous_group = it->second.multicast_group;
+                }
+                if (previous_group != group) {
+                    // Join may block; keep eventgroup_subscriptions_mutex_ released.
+                    // Acquire the new group before publishing it on the subscription so
+                    // a concurrent unsubscribe cannot release a slot that was never
+                    // acquired, and cannot drop the prior group until ownership of the
+                    // new group is confirmed. Re-check after the join: only publish
+                    // when the record still holds previous_group; otherwise release.
+                    acquire_multicast_membership(group);
+                    bool published = false;
+                    {
+                        platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+                        const auto it = eventgroup_subscriptions_.find(key);
+                        if (it != eventgroup_subscriptions_.end() &&
+                            it->second.multicast_group == previous_group) {
+                            it->second.multicast_group = group;
+                            published = true;
+                        }
+                    }
+                    if (!published) {
+                        release_multicast_membership(group);
+                    } else if (!previous_group.empty()) {
+                        release_multicast_membership(previous_group);
+                    }
+                }
+                return;
             }
+        }
+
+        platform::String<> stale_group;
+        {
+            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+            auto it = eventgroup_subscriptions_.find(key);
+            if (it == eventgroup_subscriptions_.end()) {
+                return;
+            }
+            stale_group = it->second.multicast_group;
+            it->second.multicast_group.clear();
+        }
+        if (!stale_group.empty()) {
+            release_multicast_membership(stale_group);
         }
     }
 
@@ -842,6 +1385,16 @@ private:
             }
         }
 
+        {
+            platform::ScopedLock const lock(eventgroup_subscriptions_mutex_);
+            for (auto& eg : eventgroup_subscriptions_) {
+                if (eg.second.service_id == service_id &&
+                    eg.second.instance_id == instance_id) {
+                    eg.second.state = SubscriptionState::REQUESTED;
+                }
+            }
+        }
+
         for (const auto& sub : subs_to_renew) {
             subscribe_eventgroup(sub.service_id, sub.instance_id,
                                  sub.eventgroup_id);
@@ -865,6 +1418,16 @@ SdClient::SdClient(const SdConfig& config)
 }
 #endif
 
+SdClient::SdClient(const SdConfig& config, transport::ITransport& transport)
+#ifdef SOMEIP_STATIC_ALLOC
+{
+    new (impl_storage_) SdClientImpl(config, transport);
+}
+#else
+    : impl_(std::make_unique<SdClientImpl>(config, transport)) {
+}
+#endif
+
 SdClient::~SdClient() {
 #ifdef SOMEIP_STATIC_ALLOC
     impl()->~SdClientImpl();
@@ -873,6 +1436,14 @@ SdClient::~SdClient() {
 
 bool SdClient::initialize() {
     return impl()->initialize();
+}
+
+Result SdClient::get_transport_result() const {
+    return impl()->get_transport_result();
+}
+
+MulticastState SdClient::eventgroup_multicast_state() const {
+    return impl()->eventgroup_multicast_state();
 }
 
 void SdClient::shutdown() {

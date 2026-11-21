@@ -25,8 +25,10 @@
 #include "someip/message.h"
 #include "someip/types.h"
 #include "transport/endpoint.h"
+#include "transport/multicast_transport.h"
 #include "transport/transport.h"
 #include "transport/udp_transport.h"
+#include "../transport/transport_session.h"
 // NOLINTNEXTLINE(misc-include-cleaner) - someip_hton*/someip_ntoh* macros from byteorder_impl.h
 #include "platform/byteorder.h"
 // NOLINTNEXTLINE(misc-include-cleaner) - someip_inet_*/AF_INET/in_addr via net_impl.h
@@ -69,16 +71,30 @@ class SdServerImpl : public transport::ITransportListener {
 public:
     explicit SdServerImpl(const SdConfig& config)
         : config_(config),
-          transport_(transport::Endpoint("0.0.0.0", config.multicast_port),
-                     make_sd_transport_config(config)),
+          transport_session_(transport::Endpoint("0.0.0.0", config.multicast_port),
+                             make_sd_transport_config(config)),
+          transport_(transport_session_.get()),
+          multicast_(transport_session_.multicast()),
           running_(false) {
+    }
 
-        transport_.set_listener(this);
+    SdServerImpl(const SdConfig& config, transport::ITransport& transport)
+        : config_(config),
+          transport_session_(transport),
+          transport_(transport_session_.get()),
+          multicast_(transport_session_.multicast()),
+          running_(false) {
     }
 
     ~SdServerImpl() override
     {
+#ifdef __cpp_exceptions
+        try {
+            shutdown();
+        } catch (...) {}  // NOLINT(bugprone-empty-catch) destructor must not throw
+#else
         shutdown();
+#endif
     }
 
     SdServerImpl(const SdServerImpl&) = delete;
@@ -92,13 +108,24 @@ public:
             return true;
         }
 
-        if (transport_.start() != Result::SUCCESS) {
+        if (multicast_ == nullptr) {
             return false;
         }
 
-        // Join multicast group for SD messages
-        if (!join_multicast_group()) {
-            // Continue without multicast support in constrained environments
+        if (transport_session_.start(*this) != Result::SUCCESS) {
+            return false;
+        }
+
+        // Join multicast group for SD messages. Failure is not fatal — the server
+        // still answers unicast SD — but it must be visible and re-attempted by
+        // the offer timer rather than reported as a healthy start.
+        {
+            platform::ScopedLock const lock(sd_multicast_mutex_);
+            if (join_multicast_group()) {
+                sd_multicast_.note_join_success();
+            } else {
+                sd_multicast_.note_join_failure(rejoin_config(), MulticastMembership::clock::now());
+            }
         }
 
         running_ = true;
@@ -109,9 +136,23 @@ public:
         return true;
     }
 
+    /**
+     * @brief Local SD multicast membership state
+     * @implements REQ_TRANSPORT_011_E01
+     */
+    MulticastState multicast_state() const {
+        platform::ScopedLock const lock(sd_multicast_mutex_);
+        return sd_multicast_.state();
+    }
+
     /** @implements REQ_SD_090, REQ_SD_091, REQ_SD_092, REQ_SD_093, REQ_SD_094 */
+    Result get_transport_result() const {
+        return transport_session_.result();
+    }
+
     void shutdown() {
         if (!running_) {
+            transport_session_.stop();
             return;
         }
 
@@ -127,10 +168,10 @@ public:
         platform::ScopedLock const lock(offered_services_mutex_);
         offered_services_.clear();
 
-        // Leave multicast group
+        // Leave multicast group (cancels any pending re-attempt)
         leave_multicast_group();
 
-        transport_.stop();
+        transport_session_.stop();
     }
 
     /** @implements REQ_SD_100, REQ_SD_101, REQ_SD_102, REQ_SD_103, REQ_SD_110, REQ_SD_111, REQ_SD_112, REQ_SD_113, REQ_SD_130, REQ_SD_140, REQ_SD_141, REQ_SD_142, REQ_SD_150, REQ_SD_151, REQ_SD_152 */
@@ -352,12 +393,40 @@ private:
         return true;
     }
 
+    MulticastRejoinConfig rejoin_config() const {
+        MulticastRejoinConfig cfg;
+        cfg.max_attempts = config_.multicast_rejoin_max_attempts;
+        cfg.interval = config_.multicast_rejoin_interval;
+        return cfg;
+    }
+
     bool join_multicast_group() {
-        return transport_.join_multicast_group(config_.multicast_address) == Result::SUCCESS;
+        if (multicast_ == nullptr) {
+            return false;
+        }
+        return multicast_->join_multicast_group(config_.multicast_address) == Result::SUCCESS;
     }
 
     void leave_multicast_group() {
-        transport_.leave_multicast_group(config_.multicast_address);
+        if (multicast_ != nullptr) {
+            (void)multicast_->leave_multicast_group(config_.multicast_address);
+        }
+        platform::ScopedLock const lock(sd_multicast_mutex_);
+        sd_multicast_.cancel();
+    }
+
+    /** @implements REQ_TRANSPORT_011_E03 */
+    void retry_multicast_join_if_pending() {
+        platform::ScopedLock const lock(sd_multicast_mutex_);
+        if (!sd_multicast_.is_retrying()) {
+            return;
+        }
+        const auto now = MulticastMembership::clock::now();
+        if (!sd_multicast_.due(now)) {
+            return;
+        }
+        const bool ok = join_multicast_group();
+        sd_multicast_.note_rejoin_result(ok, rejoin_config(), now);
     }
 
     /** @implements REQ_SD_250, REQ_SD_251, REQ_SD_260 */
@@ -368,7 +437,18 @@ private:
 
         offer_timer_thread_.emplace([this]() {
             while (running_) {
-                const auto sleep_time = send_due_offers();
+                retry_multicast_join_if_pending();
+
+                auto sleep_time = send_due_offers();
+                {
+                    platform::ScopedLock const lock(sd_multicast_mutex_);
+                    const auto now = MulticastMembership::clock::now();
+                    if (const auto until = sd_multicast_.time_until_retry(now)) {
+                        if (*until < sleep_time) {
+                            sleep_time = *until;
+                        }
+                    }
+                }
 
                 if (!running_) {
                     break;
@@ -492,7 +572,7 @@ private:
         if (parse_endpoint_string(service.unicast_endpoint, ep_ip, ep_port)) {
             endpoint_option.set_ipv4_address_from_string(ep_ip);
             endpoint_option.set_port(ep_port);
-            endpoint_option.set_protocol(0x11);
+            endpoint_option.set_protocol(service.instance.protocol);
         } else {
             return;
         }
@@ -595,15 +675,22 @@ private:
         // TODO: Handle transport errors
     }
 
-    /** @implements REQ_SD_300, REQ_SD_312, REQ_SD_818 */
+    /** @implements REQ_SD_300, REQ_SD_312, REQ_SD_818, REQ_SD_1084, REQ_SD_343
+     *  @satisfies feat_req_someipsd_1084, feat_req_someipsd_1151 */
     void process_sd_entries(const SdMessage& message, const transport::Endpoint& sender,
                            bool via_multicast) {
+        platform::String<> sd_address;
+        uint16_t sd_port = 0;
+        const transport::Endpoint reply_to = message.ipv4_sd_endpoint(sd_address, sd_port)
+            ? transport::Endpoint(sd_address, sd_port)
+            : sender;
+
         for (const auto& entry_var : message.get_entries()) {
             const SdEntry* entry = get_entry_ptr(entry_var);
             switch (entry->get_type()) {
                 case EntryType::FIND_SERVICE:
                     if (const auto* se = std::get_if<ServiceEntry>(&entry_var)) {
-                        handle_find_service(*se, sender);
+                        handle_find_service(*se, reply_to);
                     }
                     break;
                 case EntryType::SUBSCRIBE_EVENTGROUP:
@@ -611,7 +698,7 @@ private:
                         break;
                     }
                     if (const auto* eg = std::get_if<EventGroupEntry>(&entry_var)) {
-                        handle_eventgroup_subscription_request(*eg, message, sender);
+                        handle_eventgroup_subscription_request(*eg, message, sender, reply_to);
                     }
                     break;
                 default:
@@ -642,14 +729,20 @@ private:
      *  @satisfies feat_req_someipsd_848, feat_req_someipsd_1084 */
     void handle_eventgroup_subscription_request(const EventGroupEntry& subscription_entry,
                                                const SdMessage& message,
-                                               const transport::Endpoint& sender) {
+                                               const transport::Endpoint& sender,
+                                               const transport::Endpoint& reply_to) {
         const uint16_t service_id = subscription_entry.get_service_id();
         const uint16_t instance_id = subscription_entry.get_instance_id();
         const uint16_t eventgroup_id = subscription_entry.get_eventgroup_id();
         const uint32_t ttl = subscription_entry.get_ttl();
 
+        if (message.entry_references_ipv4_sd_endpoint(subscription_entry)) {
+            send_subscribe_nack(subscription_entry, reply_to);
+            return;
+        }
+
         if (ttl == 0) {
-            handle_stop_subscribe(subscription_entry, sender);
+            handle_stop_subscribe(subscription_entry, reply_to);
             return;
         }
 
@@ -677,7 +770,7 @@ private:
             }
         }
         if (nack) {
-            send_subscribe_nack(subscription_entry, sender);
+            send_subscribe_nack(subscription_entry, reply_to);
             return;
         }
 
@@ -741,19 +834,25 @@ private:
         }
 
         if (has_conflicting_options) {
-            send_subscribe_nack(subscription_entry, sender);
+            send_subscribe_nack(subscription_entry, reply_to);
             return;
         }
 
         if (event_port == 0) {
-            send_subscribe_nack(subscription_entry, sender);
+            send_subscribe_nack(subscription_entry, reply_to);
             return;
         }
 
         (void)event_protocol;
+        InitialDataDelivery delivery = InitialDataDelivery::DEFAULT;
+        if (message.explicit_initial_data_control()) {
+            delivery = subscription_entry.get_initial_data_requested()
+                ? InitialDataDelivery::REQUESTED
+                : InitialDataDelivery::SUPPRESSED;
+        }
         send_subscribe_response(
-            subscription_entry, sender, true, ttl,
-            transport::Endpoint(event_ip, event_port));
+            subscription_entry, reply_to, true, ttl,
+            transport::Endpoint(event_ip, event_port), delivery);
     }
 
     void handle_stop_subscribe(const EventGroupEntry& subscription_entry,
@@ -765,12 +864,13 @@ private:
         send_subscribe_response(entry, client, false, 0, client);
     }
 
-    /** @implements REQ_SD_272, REQ_SD_1084
-     *  @satisfies feat_req_someipsd_1084 */
+    /** @implements REQ_SD_272, REQ_SD_1084, REQ_SD_331
+     *  @satisfies feat_req_someipsd_1084, feat_req_someipsd_1188, feat_req_someipsd_1194 */
     bool send_subscribe_response(const EventGroupEntry& request,
                                  const transport::Endpoint& reply_to,
                                  bool acknowledge, uint32_t ttl_seconds,
-                                 const transport::Endpoint& event_endpoint) {
+                                 const transport::Endpoint& event_endpoint,
+                                 InitialDataDelivery initial_data = InitialDataDelivery::DEFAULT) {
         EventGroupEntry response_entry(
             acknowledge ? EntryType::SUBSCRIBE_EVENTGROUP_ACK : EntryType::SUBSCRIBE_EVENTGROUP_NACK);
         response_entry.set_service_id(request.get_service_id());
@@ -839,7 +939,7 @@ private:
             }
             if (cb) {
                 cb(request.get_service_id(), request.get_instance_id(),
-                   request.get_eventgroup_id(), event_endpoint);
+                   request.get_eventgroup_id(), event_endpoint, initial_data);
             }
         }
         return result == Result::SUCCESS;
@@ -870,7 +970,7 @@ private:
         if (parse_endpoint_string(service.unicast_endpoint, ep_ip, ep_port)) {
             endpoint_option.set_ipv4_address_from_string(ep_ip);
             endpoint_option.set_port(ep_port);
-            endpoint_option.set_protocol(0x11);
+            endpoint_option.set_protocol(service.instance.protocol);
         } else {
             return;
         }
@@ -901,12 +1001,16 @@ private:
     }
 
     SdConfig config_;
-    transport::UdpTransport transport_;
+    transport::detail::TransportSession transport_session_;
+    transport::ITransport& transport_;
+    transport::IMulticastTransport* multicast_;
 
     platform::Vector<OfferedService> offered_services_;
     mutable platform::Mutex offered_services_mutex_;
 
     std::optional<platform::Thread> offer_timer_thread_;
+    MulticastMembership sd_multicast_;
+    mutable platform::Mutex sd_multicast_mutex_;
     std::atomic<bool> running_;
 
     SdSessionIdCounter multicast_session_id_;
@@ -964,6 +1068,16 @@ SdServer::SdServer(const SdConfig& config)
 }
 #endif
 
+SdServer::SdServer(const SdConfig& config, transport::ITransport& transport)
+#ifdef SOMEIP_STATIC_ALLOC
+{
+    new (impl_storage_) SdServerImpl(config, transport);
+}
+#else
+    : impl_(std::make_unique<SdServerImpl>(config, transport)) {
+}
+#endif
+
 SdServer::~SdServer() {
 #ifdef SOMEIP_STATIC_ALLOC
     impl()->~SdServerImpl();
@@ -972,6 +1086,14 @@ SdServer::~SdServer() {
 
 bool SdServer::initialize() {
     return impl()->initialize();
+}
+
+Result SdServer::get_transport_result() const {
+    return impl()->get_transport_result();
+}
+
+MulticastState SdServer::multicast_state() const {
+    return impl()->multicast_state();
 }
 
 void SdServer::shutdown() {

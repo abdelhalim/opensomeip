@@ -52,7 +52,13 @@ End-to-End (E2E) protection provides data integrity, sequence validation, and fr
 
 ### E2E Header Insertion
 
-According to `feat_req_someip_102`, the E2E header is inserted after the Return Code field. The default offset is 64 bits (8 bytes).
+According to `feat_req_someip_102`, the E2E header position is the configured Offset in bits from the start of the Length-covered region (Request ID). The default of 64 bits places the header immediately after Return Code (wire byte 16). A larger byte-aligned Offset places the header at wire byte `8 + offset_bits/8`. The bytes between Return Code and that index are an unprotected prefix: they are not application payload and the basic profile does not include them in the CRC. Length (`feat_req_someip_77`) still covers the prefix, the header, and the payload.
+
+`Message` stores profile bytes up to `SOMEIP_MAX_E2E_HEADER_SIZE` (64) and a prefix up to `SOMEIP_MAX_E2E_PREFIX_SIZE` (64). The 12-byte `E2EHeader` view is only for a 12-byte header. Deserialize does not infer Offset or size from the datagram: `expect_e2e=true` is the default layout, and any other layout is `E2EParseOptions`.
+
+`Result::NOT_INITIALIZED` is returned first when no profile is registered. `offset_bits < 64` (overlap with the SOME/IP header) and a non-multiple of 8 return `Result::INVALID_ARGUMENT`. A prefix or header above the compile-time cap returns `Result::NOT_IMPLEMENTED`. CRC, Data ID, and replay failures stay `Result::INVALID_ARGUMENT`.
+
+SOME/IP-TP and the default E2E layout both start at wire byte 16. A message that already carries an E2E header is not segmented, including when Offset is not 64. Reassembly finishes before E2E parse. The C ABI remains the default layout and has no Offset field.
 
 ### CRC Calculation
 
@@ -61,7 +67,7 @@ CRC algorithms implemented:
 - **ITU-T X.25**: 16-bit CRC (polynomial 0x1021, CCITT)
 - **CRC32**: 32-bit CRC (polynomial 0x04C11DB7)
 
-CRC covers: Message ID, Length, Request ID, Protocol Version, Interface Version, Message Type, Return Code, and Payload. The E2E header itself is NOT included in CRC calculation.
+CRC covers: Message ID, Length, Request ID, Protocol Version, Interface Version, Message Type, Return Code, and application payload. The E2E header and the unprotected prefix are not included. The Length value inside the CRC does include the prefix and the header.
 
 ### Counter Management
 
@@ -131,9 +137,22 @@ These standards are publicly available and not AUTOSAR proprietary.
 ## Error Handling
 
 E2E protection errors are propagated via `Result` codes:
-- `Result::INVALID_ARGUMENT` - CRC mismatch, wrong data ID
+- `Result::NOT_INITIALIZED` - Profile not registered (checked first)
+- `Result::INVALID_ARGUMENT` - Offset overlaps the SOME/IP header, Offset is not a multiple of 8, CRC mismatch, wrong data ID, replay, or other caller errors
+- `Result::NOT_IMPLEMENTED` - byte-aligned Offset or profile header that exceeds `SOMEIP_MAX_E2E_PREFIX_SIZE` / `SOMEIP_MAX_E2E_HEADER_SIZE`
 - `Result::TIMEOUT` - Freshness timeout
-- `Result::NOT_INITIALIZED` - Profile not registered
+
+## Receive path
+
+Transports do not infer E2E from the datagram. `E2EReceiveTable` on the
+transport config lists protected Service ID and Method/Event ID values.
+After a complete frame is available, and after TP reassembly, the default
+12-byte header at Offset 64 is removed from the payload.
+
+Stack-managed mode calls `E2EProtection::validate` and, on failure, reports
+`MessageRejectionStage::E2E_INTEGRITY` instead of the application handler.
+Application-managed mode delivers `get_e2e_header()` with the clean payload
+so the application can call `validate` without serializing again.
 
 ## Performance Considerations
 

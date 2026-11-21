@@ -75,6 +75,7 @@ typedef enum {
     OPENSOMEIP_RESULT_CONNECTION_REFUSED   = 0x04,
     OPENSOMEIP_RESULT_TIMEOUT              = 0x05,
     OPENSOMEIP_RESULT_INVALID_ENDPOINT     = 0x06,
+    OPENSOMEIP_RESULT_MULTICAST_ERROR      = 0x07,
 
     OPENSOMEIP_RESULT_INVALID_MESSAGE      = 0x10,
     OPENSOMEIP_RESULT_INVALID_MESSAGE_TYPE = 0x11,
@@ -516,7 +517,15 @@ OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_event_subscriber_destroy(open
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_event_subscriber_initialize(opensomeip_event_subscriber_t* s);
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_event_subscriber_shutdown(opensomeip_event_subscriber_t* s);
 
-/** @implements REQ_CAPI_004, REQ_CAPI_012 */
+/** @implements REQ_CAPI_004, REQ_CAPI_012
+ *  Each subscriber supports only one instance/eventgroup key per service.
+ *  A distinct same-service key returns OPENSOMEIP_RESULT_SUBSCRIPTION_FAILED
+ *  without sending or replacing the existing subscription. An unresolved
+ *  destination returns OPENSOMEIP_RESULT_INVALID_ENDPOINT. A transport send
+ *  failure returns that send result. Exact-key renewal and different services
+ *  are supported; a failed renewal leaves the previous subscription in place.
+ *  Unsubscribe releases the service slot.
+ *  Notifications do not carry instance/eventgroup identity. */
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_event_subscriber_subscribe(opensomeip_event_subscriber_t* s,
                                                            uint16_t service_id,
                                                            uint16_t instance_id,
@@ -524,6 +533,12 @@ OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_event_subscriber_subscribe(op
                                                            opensomeip_event_callback_t callback,
                                                            void* user_data);
 
+/** @implements REQ_CAPI_004, REQ_CAPI_012
+ *  Blocks until notification callbacks matched to this exact subscription
+ *  and admitted before removal have returned. Calling it from inside a
+ *  notification callback of the same subscriber is safe and does not block.
+ *  Calling it from a different thread that a notification callback is
+ *  synchronously waiting on will deadlock. */
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_event_subscriber_unsubscribe(opensomeip_event_subscriber_t* s,
                                                              uint16_t service_id,
                                                              uint16_t instance_id,
@@ -567,14 +582,15 @@ OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_e2e_create(opensomeip_e2e_t**
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_e2e_destroy(opensomeip_e2e_t* e);
 
 /** @implements REQ_CAPI_013
- *  Protect message (adds E2E header). */
+ *  Protect a message with the default E2E layout (12-byte header, Offset 64).
+ *  Offset and other header sizes are C++-only; this ABI has no Offset field. */
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_e2e_protect(opensomeip_e2e_t* e,
                                             opensomeip_message_t* msg,
                                             uint16_t data_id,
                                             uint32_t counter);
 
 /** @implements REQ_CAPI_013
- *  Check message E2E protection. */
+ *  Check E2E protection on the default layout (12-byte header, Offset 64). */
 OPENSOMEIP_CAPI_API opensomeip_result_t opensomeip_e2e_check(opensomeip_e2e_t* e,
                                           const opensomeip_message_t* msg,
                                           uint16_t data_id);

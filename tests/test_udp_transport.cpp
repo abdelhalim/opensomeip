@@ -14,12 +14,19 @@
 #include <gtest/gtest.h>
 #include <transport/udp_transport.h>
 #include <transport/transport.h>
+#include <transport/message_rejection.h>
 #include <someip/message.h>
+#include <e2e/e2e_protection.h>
+#include <e2e/e2e_config.h>
+#include <e2e/e2e_receive_policy.h>
 #include <platform/buffer_pool.h>
 #include <platform/containers.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 #include "static_pool_init.h"
 
@@ -38,6 +45,7 @@ using namespace someip::transport;
  * @tests REQ_TRANSPORT_006, REQ_TRANSPORT_010, REQ_TRANSPORT_011
  * @tests REQ_TRANSPORT_012, REQ_TRANSPORT_013, REQ_TRANSPORT_014, REQ_TRANSPORT_015
  * @tests REQ_TRANSPORT_022, REQ_TRANSPORT_023, REQ_TRANSPORT_024
+ * @tests REQ_TRANSPORT_026
  * @tests REQ_TRANSPORT_001_E01, REQ_TRANSPORT_001_E02, REQ_TRANSPORT_001_E03
  * @tests REQ_TRANSPORT_006_E01, REQ_TRANSPORT_011_E01, REQ_TRANSPORT_011_E02
  * @tests REQ_TRANSPORT_014_E01
@@ -94,6 +102,12 @@ public:
         cv_.notify_one();
     }
 
+    void on_message_rejected(const MessageRejectionInfo& info) override {
+        std::scoped_lock lock(mutex_);
+        rejections_.push_back(info);
+        cv_.notify_one();
+    }
+
     // Helper methods
     bool wait_for_message(std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
         std::unique_lock lock(mutex_);
@@ -103,6 +117,11 @@ public:
     bool wait_for_error(std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
         std::unique_lock lock(mutex_);
         return cv_.wait_for(lock, timeout, [this]() { return error_count_ > 0; });
+    }
+
+    bool wait_for_rejection(std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this]() { return !rejections_.empty(); });
     }
 
     bool wait_for_messages(size_t expected_count,
@@ -125,9 +144,11 @@ public:
         connection_established_ = false;
         last_error_ = Result::SUCCESS;
         error_count_ = 0;
+        rejections_.clear();
     }
 
     std::vector<std::pair<MessagePtr, Endpoint>> received_messages_;
+    std::vector<MessageRejectionInfo> rejections_;
     std::atomic<bool> connection_lost_{false};
     std::atomic<bool> connection_established_{false};
     std::atomic<Result> last_error_{Result::SUCCESS};
@@ -297,6 +318,65 @@ TEST_F(UdpTransportTest, MessageRoundTrip) {
     receiver.stop();
 }
 
+/**
+ * @test_case TC_UDP_REJECT_001
+ * @tests REQ_TRANSPORT_026
+ * @brief A malformed UDP datagram produces one rejection and no message callback
+ */
+TEST_F(UdpTransportTest, MalformedDatagramNotifiesRejectionNotMessage) {
+    config.blocking = true;
+    config.enable_tp = false;
+    UdpTransport sender(local_endpoint, config);
+    UdpTransport receiver(local_endpoint, config);
+
+    TestUdpListener sender_listener;
+    TestUdpListener receiver_listener;
+    sender.set_listener(&sender_listener);
+    receiver.set_listener(&receiver_listener);
+
+    ASSERT_EQ(sender.start(), Result::SUCCESS);
+    ASSERT_EQ(receiver.start(), Result::SUCCESS);
+
+    Message bad;
+    bad.set_service_id(0x1234);
+    bad.set_method_id(0x5678);
+    bad.set_client_id(0x9ABC);
+    bad.set_session_id(0x0001);
+    bad.set_protocol_version(0x99);
+    bad.set_interface_version(1);
+    bad.set_message_type(MessageType::REQUEST);
+    bad.set_return_code(ReturnCode::E_OK);
+    bad.set_payload({0x01, 0x02});
+
+    EXPECT_EQ(sender.send_message(bad, receiver.get_local_endpoint()), Result::SUCCESS);
+
+    EXPECT_TRUE(receiver_listener.wait_for_rejection());
+    EXPECT_FALSE(receiver_listener.wait_for_message(std::chrono::milliseconds(150)));
+    ASSERT_EQ(receiver_listener.rejections_.size(), 1u);
+    EXPECT_EQ(receiver_listener.received_messages_.size(), 0u);
+    const MessageRejectionInfo& info = receiver_listener.rejections_[0];
+    EXPECT_EQ(info.result, Result::MALFORMED_MESSAGE);
+    EXPECT_EQ(info.stage, MessageRejectionStage::DESERIALIZE);
+    EXPECT_TRUE(info.has_message_id);
+    EXPECT_EQ(info.message_id.service_id, 0x1234);
+    EXPECT_EQ(info.message_id.method_id, 0x5678);
+    EXPECT_TRUE(info.has_request_id);
+    EXPECT_EQ(info.request_id.client_id, 0x9ABC);
+
+    sender.stop();
+    receiver.stop();
+}
+
+TEST(MessageRejectionIds, ShortWirePrefixReportsMessageIdOnly) {
+    const uint8_t wire[] = {0x12, 0x34, 0x56, 0x78, 0xAA, 0xBB};
+    MessageRejectionInfo info;
+    fill_rejection_ids(info, wire, sizeof(wire));
+    EXPECT_TRUE(info.has_message_id);
+    EXPECT_EQ(info.message_id.service_id, 0x1234);
+    EXPECT_EQ(info.message_id.method_id, 0x5678);
+    EXPECT_FALSE(info.has_request_id);
+}
+
 // Test non-blocking mode behavior (should not block on receive)
 TEST_F(UdpTransportTest, NonBlockingModeBehavior) {
     config.blocking = false;
@@ -364,6 +444,57 @@ TEST_F(UdpTransportTest, MulticastSupport) {
     // Should succeed since the functionality is implemented
     EXPECT_EQ(result1, Result::SUCCESS);
     EXPECT_EQ(result2, Result::SUCCESS);
+
+    transport.stop();
+}
+
+/**
+ * @test_case TC_UDP_MC_E01
+ * @tests REQ_TRANSPORT_011_E01
+ * @brief A failed multicast join returns MULTICAST_ERROR with diagnostics
+ *
+ * injected_multicast_join_errno skips IP_ADD_MEMBERSHIP, so the failure does
+ * not depend on whether the configured interface is assigned on this host.
+ */
+TEST_F(UdpTransportTest, MulticastJoinFailureIsReportedWithDiagnostics) {
+    config.multicast_interface = "203.0.113.1";
+    config.injected_multicast_join_errno = 99;
+
+    UdpTransport transport(local_endpoint, config);
+    TestUdpListener listener;
+    transport.set_listener(&listener);
+
+    EXPECT_EQ(transport.start(), Result::SUCCESS);
+    EXPECT_EQ(transport.join_multicast_group("239.255.255.251"), Result::MULTICAST_ERROR);
+
+    auto const error = transport.last_multicast_error();
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(error->group_address, "239.255.255.251");
+    EXPECT_EQ(error->interface_address, "203.0.113.1");
+    EXPECT_EQ(error->system_error, 99);
+
+    transport.stop();
+}
+
+/**
+ * @test_case TC_UDP_MC_E02
+ * @tests REQ_TRANSPORT_011_E01
+ * @brief A successful join clears previously recorded failure context
+ */
+TEST_F(UdpTransportTest, MulticastJoinSuccessClearsDiagnostics) {
+    UdpTransport transport(local_endpoint, config);
+    TestUdpListener listener;
+    transport.set_listener(&listener);
+
+    EXPECT_EQ(transport.start(), Result::SUCCESS);
+
+    // Seed diagnostics with a leave of a group that was never joined.
+    EXPECT_EQ(transport.leave_multicast_group("224.0.0.1"), Result::MULTICAST_ERROR);
+    ASSERT_TRUE(transport.last_multicast_error().has_value());
+
+    EXPECT_EQ(transport.join_multicast_group("224.0.0.1"), Result::SUCCESS);
+    EXPECT_FALSE(transport.last_multicast_error().has_value());
+    EXPECT_EQ(transport.leave_multicast_group("224.0.0.1"), Result::SUCCESS);
 
     transport.stop();
 }
@@ -1117,9 +1248,11 @@ TEST_F(UdpTransportTest, QueuedMessagesPreservedWhenListenerInstalled) {
  */
 TEST_F(UdpTransportTest, TpSegmentsAndReassemblesLargePayload) {
     config.enable_tp = true;
-    config.tp_config.max_segment_size = 32;  // force multiple TP segments
+    config.tp_config.max_segment_size = 32;  // TP chunk size, 16-byte aligned
     config.tp_config.max_message_size = 10000;
-    config.max_message_size = 0;
+    // Budget is the serialized message. An 80-byte payload is 96 bytes on
+    // the wire, which is past this ceiling, so it is segmented.
+    config.max_message_size = Message::get_header_size() + 32;
 
     UdpTransport sender(local_endpoint, config);
     UdpTransport receiver(local_endpoint, config);
@@ -1198,6 +1331,431 @@ TEST_F(UdpTransportTest, SmallMessageNotTpFlagged) {
     EXPECT_EQ(receiver_listener.received_messages_[0].first->get_message_type(),
               MessageType::REQUEST);
     EXPECT_EQ(receiver_listener.received_messages_[0].first->get_payload().size(), 3u);
+
+    sender.stop();
+    receiver.stop();
+}
+
+namespace {
+
+Message protect_udp_message() {
+    Message message(MessageId(0x1234, 0x0007), RequestId(0x0001, 0x0002), MessageType::REQUEST,
+                    ReturnCode::E_OK);
+    message.set_payload(platform::ByteBuffer{0x0A, 0x0B, 0x0C, 0x0D});
+    e2e::E2EConfig e2e_config(0x0100);
+    e2e_config.enable_freshness = false;
+    e2e::E2EProtection protection;
+    EXPECT_EQ(protection.protect(message, e2e_config), Result::SUCCESS);
+    return message;
+}
+
+e2e::E2EReceiveBinding udp_e2e_binding(e2e::E2EReceivePolicy policy) {
+    e2e::E2EReceiveBinding binding;
+    binding.service_id = 0x1234;
+    binding.method_id = 0x0007;
+    binding.data_id = 0x0100;
+    binding.policy = policy;
+    binding.enable_freshness = false;
+    return binding;
+}
+
+}  // namespace
+
+/**
+ * @test_case TC_UDP_E2E_001
+ * @tests REQ_E2E_RECEIVE_001
+ * @brief Stack-managed UDP receive validates the default layout and rejects a bad CRC
+ */
+TEST_F(UdpTransportTest, StackManagedE2ERejectsCorruption) {
+    config.blocking = true;
+    config.enable_tp = false;
+    UdpTransport sender(local_endpoint, config);
+
+    UdpTransportConfig recv_config = config;
+    ASSERT_EQ(recv_config.e2e_receive.add(udp_e2e_binding(e2e::E2EReceivePolicy::STACK_MANAGED)),
+              Result::SUCCESS);
+    UdpTransport receiver(local_endpoint, recv_config);
+
+    TestUdpListener receiver_listener;
+    receiver.set_listener(&receiver_listener);
+    ASSERT_EQ(sender.start(), Result::SUCCESS);
+    ASSERT_EQ(receiver.start(), Result::SUCCESS);
+
+    Message good = protect_udp_message();
+    const platform::ByteBuffer payload = good.get_payload();
+    ASSERT_EQ(sender.send_message(good, receiver.get_local_endpoint()), Result::SUCCESS);
+    ASSERT_TRUE(receiver_listener.wait_for_message());
+    ASSERT_EQ(receiver_listener.received_messages_.size(), 1u);
+    EXPECT_EQ(receiver_listener.received_messages_[0].first->get_payload(), payload);
+    EXPECT_TRUE(receiver_listener.received_messages_[0].first->has_e2e_header());
+    EXPECT_TRUE(receiver_listener.rejections_.empty());
+
+    Message bad = protect_udp_message();
+    platform::ByteBuffer flipped = bad.get_payload();
+    flipped[0] ^= 0xFFU;
+    bad.set_payload(flipped);
+    ASSERT_EQ(sender.send_message(bad, receiver.get_local_endpoint()), Result::SUCCESS);
+    ASSERT_TRUE(receiver_listener.wait_for_rejection());
+    ASSERT_EQ(receiver_listener.rejections_.size(), 1u);
+    EXPECT_EQ(receiver_listener.rejections_[0].stage, MessageRejectionStage::E2E_INTEGRITY);
+    EXPECT_EQ(receiver_listener.rejections_[0].result, Result::INVALID_ARGUMENT);
+    EXPECT_EQ(receiver_listener.rejections_[0].message_id.service_id, 0x1234);
+    EXPECT_EQ(receiver_listener.rejections_[0].message_id.method_id, 0x0007);
+    EXPECT_EQ(receiver_listener.received_messages_.size(), 1u);
+
+    sender.stop();
+    receiver.stop();
+}
+
+/**
+ * @test_case TC_UDP_E2E_002
+ * @tests REQ_E2E_RECEIVE_001
+ * @brief Application-managed UDP receive exposes a clean payload and E2E metadata
+ */
+TEST_F(UdpTransportTest, ApplicationManagedE2EExposesMetadata) {
+    config.blocking = true;
+    config.enable_tp = false;
+    UdpTransport sender(local_endpoint, config);
+
+    UdpTransportConfig recv_config = config;
+    ASSERT_EQ(
+        recv_config.e2e_receive.add(udp_e2e_binding(e2e::E2EReceivePolicy::APPLICATION_MANAGED)),
+        Result::SUCCESS);
+    UdpTransport receiver(local_endpoint, recv_config);
+
+    TestUdpListener receiver_listener;
+    receiver.set_listener(&receiver_listener);
+    ASSERT_EQ(sender.start(), Result::SUCCESS);
+    ASSERT_EQ(receiver.start(), Result::SUCCESS);
+
+    Message sent = protect_udp_message();
+    platform::ByteBuffer flipped = sent.get_payload();
+    const platform::ByteBuffer original = flipped;
+    flipped[0] ^= 0xFFU;
+    sent.set_payload(flipped);
+    ASSERT_EQ(sender.send_message(sent, receiver.get_local_endpoint()), Result::SUCCESS);
+    ASSERT_TRUE(receiver_listener.wait_for_message());
+    ASSERT_TRUE(receiver_listener.rejections_.empty());
+    const MessagePtr& received = receiver_listener.received_messages_[0].first;
+    EXPECT_EQ(received->get_payload(), flipped);
+    EXPECT_EQ(received->get_payload().size(), original.size());
+    ASSERT_TRUE(received->get_e2e_header().has_value());
+
+    e2e::E2EConfig e2e_config(0x0100);
+    e2e_config.enable_freshness = false;
+    e2e::E2EProtection protection;
+    EXPECT_EQ(protection.validate(*received, e2e_config), Result::INVALID_ARGUMENT);
+
+    sender.stop();
+    receiver.stop();
+}
+
+/**
+ * @test_case TC_UDP_E2E_003
+ * @tests REQ_E2E_RECEIVE_001, REQ_TRANSPORT_026
+ * @brief A bound datagram shorter than the SOME/IP header reports wire IDs.
+ */
+TEST_F(UdpTransportTest, BoundShortDatagramReportsWireIds) {
+    config.blocking = true;
+    config.enable_tp = false;
+    UdpTransportConfig recv_config = config;
+    ASSERT_EQ(recv_config.e2e_receive.add(udp_e2e_binding(e2e::E2EReceivePolicy::STACK_MANAGED)),
+              Result::SUCCESS);
+    UdpTransport receiver(local_endpoint, recv_config);
+    TestUdpListener receiver_listener;
+    receiver.set_listener(&receiver_listener);
+    ASSERT_EQ(receiver.start(), Result::SUCCESS);
+
+    const someip_socket_t fd = someip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_NE(fd, SOMEIP_INVALID_SOCKET);
+    const Endpoint dest = receiver.get_local_endpoint();
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(dest.get_port());
+    ASSERT_EQ(someip_inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr), 1);
+
+    // Twelve bytes stop try_deserialize before it writes Message IDs.
+    const platform::ByteBuffer wire{0x12, 0x34, 0x00, 0x07, 0x00, 0x00, 0x00, 0x04,
+                                     0x00, 0x11, 0x00, 0x22};
+    ASSERT_EQ(someip_sendto(fd, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr*>(&addr),
+                            sizeof(addr)),
+              static_cast<ssize_t>(wire.size()));
+    someip_close_socket(fd);
+
+    ASSERT_TRUE(receiver_listener.wait_for_rejection());
+    ASSERT_EQ(receiver_listener.rejections_.size(), 1u);
+    const MessageRejectionInfo& info = receiver_listener.rejections_[0];
+    EXPECT_EQ(info.stage, MessageRejectionStage::DESERIALIZE);
+    EXPECT_EQ(info.result, Result::MALFORMED_MESSAGE);
+    EXPECT_TRUE(info.has_message_id);
+    EXPECT_EQ(info.message_id.service_id, 0x1234);
+    EXPECT_EQ(info.message_id.method_id, 0x0007);
+    EXPECT_TRUE(info.has_request_id);
+    EXPECT_EQ(info.request_id.client_id, 0x0011);
+    EXPECT_EQ(info.request_id.session_id, 0x0022);
+    EXPECT_TRUE(receiver_listener.received_messages_.empty());
+
+    receiver.stop();
+}
+
+namespace {
+
+constexpr size_t kSomeIpHeaderSize = 16;
+constexpr size_t kApplicationPayload = 1400;
+constexpr size_t kSingleDatagramSize = kSomeIpHeaderSize + kApplicationPayload;
+
+struct CapturedDatagram {
+    std::array<uint8_t, 2048> bytes{};
+    size_t size{0};
+};
+
+class LoopbackPeer {
+public:
+    LoopbackPeer() {
+        fd_ = someip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd_ == SOMEIP_INVALID_SOCKET) {
+            return;
+        }
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(0);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (someip_bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            someip_close_socket(fd_);
+            fd_ = SOMEIP_INVALID_SOCKET;
+            return;
+        }
+        socklen_t len = sizeof(addr);
+        if (someip_getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+            port_ = ntohs(addr.sin_port);
+        }
+    }
+
+    ~LoopbackPeer() {
+        if (fd_ != SOMEIP_INVALID_SOCKET) {
+            someip_close_socket(fd_);
+        }
+    }
+
+    LoopbackPeer(const LoopbackPeer&) = delete;
+    LoopbackPeer& operator=(const LoopbackPeer&) = delete;
+
+    [[nodiscard]] bool ok() const { return fd_ != SOMEIP_INVALID_SOCKET && port_ != 0; }
+    [[nodiscard]] uint16_t port() const { return port_; }
+
+    size_t capture(std::array<CapturedDatagram, 8>& out) {
+        someip_set_socket_timeout(fd_, SO_RCVTIMEO, 2000);
+        size_t count = 0;
+        while (count < out.size()) {
+            std::array<uint8_t, 2048> buf{};
+            sockaddr_in src{};
+            socklen_t src_len = sizeof(src);
+            const ssize_t got = someip_recvfrom(fd_, buf.data(), buf.size(), 0,
+                                                reinterpret_cast<sockaddr*>(&src), &src_len);
+            if (got < 0) {
+                const int err = someip_socket_errno();
+                if (err == SOMEIP_EINTR) {
+                    continue;
+                }
+                break;
+            }
+            out[count].size = static_cast<size_t>(got);
+            std::memcpy(out[count].bytes.data(), buf.data(), out[count].size);
+            ++count;
+            someip_set_socket_timeout(fd_, SO_RCVTIMEO, 200);
+        }
+        return count;
+    }
+
+private:
+    someip_socket_t fd_{SOMEIP_INVALID_SOCKET};
+    uint16_t port_{0};
+};
+
+Message message_with_payload(MessageType type, uint16_t session, size_t payload_size,
+                             uint8_t fill) {
+    Message message(MessageId(0x1234, 0x0001), RequestId(0x00A1, session), type, ReturnCode::E_OK);
+    message.set_payload(platform::ByteBuffer(payload_size, fill));
+    return message;
+}
+
+uint32_t read_be32(const uint8_t* bytes) {
+    return (static_cast<uint32_t>(bytes[0]) << 24U) |
+           (static_cast<uint32_t>(bytes[1]) << 16U) |
+           (static_cast<uint32_t>(bytes[2]) << 8U) |
+           static_cast<uint32_t>(bytes[3]);
+}
+
+void expect_one_unsegmented(const CapturedDatagram& datagram, MessageType type, uint8_t fill) {
+    EXPECT_EQ(datagram.size, kSingleDatagramSize);
+    if (datagram.size < kSingleDatagramSize) {
+        return;
+    }
+    EXPECT_EQ(datagram.bytes[14], static_cast<uint8_t>(type));
+    EXPECT_EQ(datagram.bytes[14] & 0x20U, 0u);
+    EXPECT_EQ(read_be32(datagram.bytes.data() + 4), 8u + kApplicationPayload);
+    EXPECT_NE(kApplicationPayload % 16u, 0u);
+    bool payload_ok = true;
+    for (size_t i = 0; i < kApplicationPayload; ++i) {
+        if (datagram.bytes[kSomeIpHeaderSize + i] != fill) {
+            payload_ok = false;
+            break;
+        }
+    }
+    EXPECT_TRUE(payload_ok);
+}
+
+}  // namespace
+
+/**
+ * @test_case TC_UDP_TP_SINGLE_1400
+ * @tests REQ_TP_090
+ * @brief A 1400-byte request and a 1400-byte response are each one datagram
+ */
+TEST(UdpSingleDatagram, PayloadOf1400IsOneDatagram) {
+    UdpTransportConfig config;
+    EXPECT_EQ(config.max_message_size, someip::tp::DEFAULT_SINGLE_DATAGRAM_SIZE);
+    EXPECT_EQ(config.max_message_size, kSingleDatagramSize);
+    EXPECT_EQ(config.tp_config.max_segment_size, someip::tp::DEFAULT_MAX_SEGMENT_PAYLOAD);
+    EXPECT_EQ(config.tp_config.max_single_datagram_size, someip::tp::DEFAULT_SINGLE_DATAGRAM_SIZE);
+#ifdef SOMEIP_STATIC_ALLOC
+    EXPECT_FALSE(config.enable_tp);
+#else
+    EXPECT_TRUE(config.enable_tp);
+#endif
+
+    LoopbackPeer peer;
+    ASSERT_TRUE(peer.ok());
+
+    UdpTransport sender(Endpoint("127.0.0.1", 0), config);
+    ASSERT_EQ(sender.start(), Result::SUCCESS);
+    const Endpoint dest("127.0.0.1", peer.port());
+
+    const Message request =
+        message_with_payload(MessageType::REQUEST, 0x0001, kApplicationPayload, 0x11);
+    ASSERT_EQ(request.get_payload().size(), kApplicationPayload);
+    ASSERT_EQ(request.get_total_size(), kSingleDatagramSize);
+    ASSERT_EQ(sender.send_message(request, dest), Result::SUCCESS);
+
+    std::array<CapturedDatagram, 8> datagrams{};
+    const size_t request_count = peer.capture(datagrams);
+    ASSERT_EQ(request_count, 1u);
+    expect_one_unsegmented(datagrams[0], MessageType::REQUEST, 0x11);
+
+    const Message response =
+        message_with_payload(MessageType::RESPONSE, 0x0001, kApplicationPayload, 0x22);
+    ASSERT_EQ(response.get_total_size(), kSingleDatagramSize);
+    ASSERT_EQ(sender.send_message(response, dest), Result::SUCCESS);
+
+    const size_t response_count = peer.capture(datagrams);
+    ASSERT_EQ(response_count, 1u);
+    expect_one_unsegmented(datagrams[0], MessageType::RESPONSE, 0x22);
+
+    sender.stop();
+}
+
+/**
+ * @test_case TC_UDP_TP_PAST_BUDGET
+ * @tests REQ_TP_090, REQ_TP_003
+ * @brief A payload one byte past the UDP budget is segmented, and real segments stay aligned
+ */
+TEST(UdpSingleDatagram, PayloadPastDatagramBudgetIsSegmented) {
+    UdpTransportConfig config;
+    config.enable_tp = true;
+    EXPECT_EQ(config.max_message_size, kSingleDatagramSize);
+
+    LoopbackPeer peer;
+    ASSERT_TRUE(peer.ok());
+
+    UdpTransport sender(Endpoint("127.0.0.1", 0), config);
+    ASSERT_EQ(sender.start(), Result::SUCCESS);
+
+    constexpr size_t kOverPayload = kApplicationPayload + 1;
+    const Message over =
+        message_with_payload(MessageType::REQUEST, 0x0002, kOverPayload, 0x33);
+    ASSERT_EQ(over.get_payload().size(), kOverPayload);
+    ASSERT_EQ(over.get_total_size(), kSingleDatagramSize + 1);
+    ASSERT_EQ(sender.send_message(over, Endpoint("127.0.0.1", peer.port())), Result::SUCCESS);
+
+    std::array<CapturedDatagram, 8> datagrams{};
+    const size_t count = peer.capture(datagrams);
+    ASSERT_GT(count, 1u);
+
+    size_t application_bytes = 0;
+    bool saw_non_final = false;
+    for (size_t i = 0; i < count; ++i) {
+        const CapturedDatagram& datagram = datagrams[i];
+        ASSERT_GE(datagram.size, 20u) << "segment " << i;
+        EXPECT_EQ(datagram.bytes[14] & 0x20U, 0x20U) << "segment " << i << " TP flag";
+        const uint32_t tp_header = read_be32(datagram.bytes.data() + 16);
+        const bool more = (tp_header & 0x01U) != 0U;
+        const uint32_t offset = (tp_header >> 4U) * 16U;
+        const size_t segment_payload = datagram.size - 20U;
+        application_bytes += segment_payload;
+        if (more) {
+            saw_non_final = true;
+            EXPECT_EQ(segment_payload % 16U, 0u) << "non-final segment " << i;
+            EXPECT_EQ(segment_payload, someip::tp::DEFAULT_MAX_SEGMENT_PAYLOAD);
+        }
+        if (i == 0) {
+            EXPECT_EQ(offset, 0u);
+        }
+    }
+    EXPECT_TRUE(saw_non_final);
+    EXPECT_EQ(application_bytes, kOverPayload);
+
+    UdpTransport receiver(Endpoint("127.0.0.1", 0), config);
+    TestUdpListener listener;
+    receiver.set_listener(&listener);
+    ASSERT_EQ(receiver.start(), Result::SUCCESS);
+    ASSERT_EQ(sender.send_message(over, receiver.get_local_endpoint()), Result::SUCCESS);
+    ASSERT_TRUE(listener.wait_for_message(std::chrono::milliseconds(2000)));
+    ASSERT_EQ(listener.received_messages_.size(), 1u);
+    const MessagePtr& received = listener.received_messages_[0].first;
+    ASSERT_NE(received, nullptr);
+    EXPECT_FALSE(received->uses_tp());
+    EXPECT_EQ(received->get_message_type(), MessageType::REQUEST);
+    EXPECT_EQ(received->get_payload().size(), kOverPayload);
+    EXPECT_EQ(received->get_payload(), over.get_payload());
+
+    sender.stop();
+    receiver.stop();
+}
+
+/**
+ * @test_case TC_UDP_TP_ZERO_BUDGET_RX
+ * @tests REQ_TP_090
+ * @brief max_message_size 0 still receives a datagram that fits the TP budget
+ */
+TEST(UdpSingleDatagram, ZeroMessageBudgetReceivesFittingDatagram) {
+    UdpTransportConfig config;
+    config.enable_tp = true;
+    config.max_message_size = 0;
+    config.tp_config.max_segment_size = 32;
+    config.receive_buffer_size = 64;
+    EXPECT_EQ(config.tp_config.max_single_datagram_size, someip::tp::DEFAULT_SINGLE_DATAGRAM_SIZE);
+
+    constexpr size_t kPayload = 80;
+    const Message message =
+        message_with_payload(MessageType::REQUEST, 0x0004, kPayload, 0x44);
+    ASSERT_GT(message.get_total_size(), config.receive_buffer_size);
+    ASSERT_LE(message.get_total_size(), config.tp_config.max_single_datagram_size);
+
+    UdpTransport sender(Endpoint("127.0.0.1", 0), config);
+    UdpTransport receiver(Endpoint("127.0.0.1", 0), config);
+    TestUdpListener listener;
+    receiver.set_listener(&listener);
+    ASSERT_EQ(sender.start(), Result::SUCCESS);
+    ASSERT_EQ(receiver.start(), Result::SUCCESS);
+
+    ASSERT_EQ(sender.send_message(message, receiver.get_local_endpoint()), Result::SUCCESS);
+    ASSERT_TRUE(listener.wait_for_message(std::chrono::milliseconds(2000)));
+    ASSERT_EQ(listener.received_messages_.size(), 1u);
+    const MessagePtr& received = listener.received_messages_[0].first;
+    ASSERT_NE(received, nullptr);
+    EXPECT_FALSE(received->uses_tp());
+    EXPECT_EQ(received->get_payload().size(), kPayload);
+    EXPECT_EQ(received->get_payload(), message.get_payload());
 
     sender.stop();
     receiver.stop();

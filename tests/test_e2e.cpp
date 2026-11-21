@@ -11,25 +11,32 @@
  * SPDX-License-Identifier: Apache-2.0
  ********************************************************************************/
 
-#include <gtest/gtest.h>
+#include <array>
 #include <cstddef>
-#include "e2e/e2e_protection.h"
-#include "e2e/e2e_header.h"
+#include <cstdint>
+#include <cstring>
+#include <gtest/gtest.h>
+#include <memory>
+
+#include "common/result.h"
 #include "e2e/e2e_config.h"
 #include "e2e/e2e_crc.h"
+#include "e2e/e2e_header.h"
+#include "e2e/e2e_layout.h"
 #include "e2e/e2e_profile_registry.h"
 #include "e2e/e2e_profiles/standard_profile.h"
-#include "someip/message.h"
-#include "common/result.h"
+#include "e2e/e2e_protection.h"
+#include "e2e/e2e_receive_policy.h"
 #include "platform/buffer_pool.h"
 #include "platform/containers.h"
+#include "someip/message.h"
 #include "static_pool_init.h"
 
 using namespace someip;
 using namespace someip::e2e;
 
 class E2ETest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
         // Initialize basic profile (reference implementation)
         initialize_basic_profile();
@@ -289,15 +296,15 @@ TEST_F(E2ETest, CRC_OverflowGuard) {
 TEST_F(E2ETest, CRC_AllTypeBranches) {
     platform::ByteBuffer data = {0x01, 0x02, 0x03, 0x04};
 
-    auto crc8  = e2ecrc::calculate_crc(data, 0, 4, 0);
+    auto crc8 = e2ecrc::calculate_crc(data, 0, 4, 0);
     auto crc16 = e2ecrc::calculate_crc(data, 0, 4, 1);
     auto crc32 = e2ecrc::calculate_crc(data, 0, 4, 2);
-    auto unk   = e2ecrc::calculate_crc(data, 0, 4, 255);
+    auto unk = e2ecrc::calculate_crc(data, 0, 4, 255);
 
     ASSERT_TRUE(crc8.has_value());
     ASSERT_TRUE(crc16.has_value());
     ASSERT_TRUE(crc32.has_value());
-    EXPECT_EQ(crc8.value(),  static_cast<uint32_t>(e2ecrc::calculate_crc8_sae_j1850(data)));
+    EXPECT_EQ(crc8.value(), static_cast<uint32_t>(e2ecrc::calculate_crc8_sae_j1850(data)));
     EXPECT_EQ(crc16.value(), static_cast<uint32_t>(e2ecrc::calculate_crc16_itu_x25(data)));
     EXPECT_EQ(crc32.value(), e2ecrc::calculate_crc32(data));
     EXPECT_FALSE(unk.has_value());
@@ -428,9 +435,7 @@ TEST_F(E2ETest, HeaderIsValid) {
  * @tests REQ_E2E_PLUGIN_005
  * @brief Header size is exactly 12 bytes
  */
-TEST_F(E2ETest, HeaderSize) {
-    EXPECT_EQ(E2EHeader::get_header_size(), 12u);
-}
+TEST_F(E2ETest, HeaderSize) { EXPECT_EQ(E2EHeader::get_header_size(), 12u); }
 
 /**
  * @test_case TC_E2E_HDR_006
@@ -728,8 +733,7 @@ TEST_F(E2ETest, DefaultConfigProfileNameMatchesRegistered) {
 
     E2EProfileRegistry& registry = E2EProfileRegistry::instance();
     E2EProfile* profile = registry.get_profile(config.profile_name);
-    EXPECT_NE(profile, nullptr)
-        << "Default profile_name must resolve to a registered profile";
+    EXPECT_NE(profile, nullptr) << "Default profile_name must resolve to a registered profile";
 }
 
 /**
@@ -778,4 +782,456 @@ TEST_F(E2ETest, HeaderFieldsPreservedAcrossWire) {
     EXPECT_EQ(decoded.counter, 42u);
     EXPECT_EQ(decoded.data_id, 0x1234u);
     EXPECT_EQ(decoded.freshness_value, 0x5678u);
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_001
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests feat_req_someip_102
+ * @brief Default offset is 64 bits from the Length-covered region
+ */
+TEST_F(E2ETest, DefaultConfigOffsetIs64Bits) {
+    E2EConfig config;
+    EXPECT_EQ(config.offset_bits, E2EConfig::DEFAULT_OFFSET_BITS);
+    EXPECT_EQ(E2EConfig::DEFAULT_OFFSET_BITS, 64u);
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_001b
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests feat_req_someip_102
+ * @brief Default 64-bit offset places the E2E header immediately after Return Code
+ */
+TEST_F(E2ETest, DefaultOffsetPlacesHeaderAfterReturnCode) {
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x5678), RequestId(0x0001, 0x0001));
+    msg.set_payload(platform::ByteBuffer{0xAA, 0xBB});
+
+    E2EConfig config(0x1234);
+    ASSERT_EQ(protection.protect(msg, config), Result::SUCCESS);
+
+    platform::ByteBuffer const wire = msg.serialize();
+    const size_t someip_header_size = Message::get_header_size();
+    const size_t e2e_header_size = E2EHeader::get_header_size();
+    ASSERT_GE(wire.size(), someip_header_size + e2e_header_size + 2);
+
+    E2EHeader header;
+    ASSERT_TRUE(header.deserialize(wire, someip_header_size));
+    EXPECT_EQ(header.data_id, 0x1234u);
+    EXPECT_EQ(wire[someip_header_size + e2e_header_size], 0xAA);
+    EXPECT_EQ(wire[someip_header_size + e2e_header_size + 1], 0xBB);
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_002
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests feat_req_someip_102
+ * @brief Offset that overlaps the SOME/IP header or is not byte-aligned is INVALID_ARGUMENT
+ */
+TEST_F(E2ETest, ProtectAndValidateRejectIllegalOffset) {
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x5678), RequestId(0x0001, 0x0001));
+    msg.set_payload(platform::ByteBuffer{0x01, 0x02, 0x03, 0x04});
+
+    E2EConfig good(0x1234);
+    ASSERT_EQ(protection.protect(msg, good), Result::SUCCESS);
+
+    E2EConfig overlap(0x1234);
+    overlap.offset_bits = 8;  // former unused default (bytes); overlaps Request ID
+    EXPECT_EQ(protection.protect(msg, overlap), Result::INVALID_ARGUMENT);
+    EXPECT_EQ(protection.validate(msg, overlap), Result::INVALID_ARGUMENT);
+
+    E2EConfig unaligned(0x1234);
+    unaligned.offset_bits = 72;  // 9 bytes; not a multiple of 8
+    EXPECT_EQ(protection.protect(msg, unaligned), Result::INVALID_ARGUMENT);
+    EXPECT_EQ(protection.validate(msg, unaligned), Result::INVALID_ARGUMENT);
+
+    EXPECT_EQ(protection.validate(msg, good), Result::SUCCESS);
+    EXPECT_TRUE(msg.has_e2e_header());
+}
+
+namespace {
+
+class OversizedHeaderProfile : public E2EProfile {
+   public:
+    Result protect(Message&, const E2EConfig&) override { return Result::SUCCESS; }
+    Result validate(const Message&, const E2EConfig&) override { return Result::SUCCESS; }
+    size_t get_header_size() const override { return MAX_E2E_HEADER_SIZE + 1; }
+    platform::String<> get_profile_name() const override { return "oversized"; }
+    uint32_t get_profile_id() const override { return 0xE2E0FF01; }
+};
+
+class FixedSizeProfile : public E2EProfile {
+   public:
+    FixedSizeProfile(size_t header_size, uint32_t id, const char* name)
+        : header_size_(header_size), id_(id), name_(name) {}
+
+    Result protect(Message& msg, const E2EConfig& config) override {
+        size_t expected_prefix = 0;
+        Result const layout = check_e2e_layout(config.offset_bits, header_size_, expected_prefix);
+        if (layout != Result::SUCCESS) {
+            return layout;
+        }
+        if (msg.e2e_unprotected_prefix_size() != expected_prefix) {
+            return Result::INVALID_ARGUMENT;
+        }
+        std::array<uint8_t, MAX_E2E_HEADER_SIZE> raw{};
+        raw[0] = 0xA5;
+        raw[1] = static_cast<uint8_t>(config.data_id & 0xFFU);
+        for (size_t i = 2; i < header_size_; ++i) {
+            raw[i] = static_cast<uint8_t>(i);
+        }
+        return msg.set_e2e_profile_bytes(config.offset_bits, raw.data(), header_size_,
+                                         msg.e2e_unprotected_prefix(), expected_prefix);
+    }
+
+    Result validate(const Message& msg, const E2EConfig& config) override {
+        if (msg.e2e_header_size() != header_size_ || msg.e2e_offset_bits() != config.offset_bits) {
+            return Result::INVALID_ARGUMENT;
+        }
+        const uint8_t* bytes = msg.e2e_header_bytes();
+        if (bytes == nullptr || bytes[0] != 0xA5 ||
+            bytes[1] != static_cast<uint8_t>(config.data_id & 0xFFU)) {
+            return Result::INVALID_ARGUMENT;
+        }
+        return Result::SUCCESS;
+    }
+
+    size_t get_header_size() const override { return header_size_; }
+    platform::String<> get_profile_name() const override { return name_; }
+    uint32_t get_profile_id() const override { return id_; }
+
+   private:
+    size_t header_size_;
+    uint32_t id_;
+    platform::String<> name_;
+};
+
+}  // namespace
+
+/**
+ * @test_case TC_E2E_OFFSET_003
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests feat_req_someip_103
+ * @brief A profile header larger than SOMEIP_MAX_E2E_HEADER_SIZE returns NOT_IMPLEMENTED
+ */
+TEST_F(E2ETest, ProtectAndValidateRejectNonStandardHeaderSize) {
+    constexpr uint32_t kProfileId = 0xE2E0FF01;
+    E2EProfileRegistry& registry = E2EProfileRegistry::instance();
+    registry.unregister_profile(kProfileId);
+    ASSERT_TRUE(registry.register_profile(std::make_unique<OversizedHeaderProfile>()));
+
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x5678), RequestId(0x0001, 0x0001));
+    msg.set_payload(platform::ByteBuffer{0x01});
+
+    E2EConfig config(0x1234);
+    config.profile_id = kProfileId;
+    config.profile_name = "oversized";
+
+    EXPECT_EQ(protection.protect(msg, config), Result::NOT_IMPLEMENTED);
+    EXPECT_EQ(protection.validate(msg, config), Result::NOT_IMPLEMENTED);
+
+    E2EConfig by_name(0x1234);
+    by_name.profile_name = "oversized";
+    EXPECT_EQ(protection.protect(msg, by_name), Result::NOT_IMPLEMENTED);
+    EXPECT_EQ(protection.validate(msg, by_name), Result::NOT_IMPLEMENTED);
+
+    // Unregistered ID must still fall through to a registered name. Exclusive
+    // ID-or-name lookup would skip "oversized" and silently protect with the
+    // default 12-byte profile instead.
+    E2EConfig unregistered_id(0x1234);
+    unregistered_id.profile_id = 9999;
+    unregistered_id.profile_name = "oversized";
+    EXPECT_EQ(protection.protect(msg, unregistered_id), Result::NOT_IMPLEMENTED);
+    EXPECT_EQ(protection.validate(msg, unregistered_id), Result::NOT_IMPLEMENTED);
+
+    EXPECT_TRUE(registry.unregister_profile(kProfileId));
+}
+
+/**
+ * @test_case TC_E2E_RX_001
+ * @tests REQ_E2E_RECEIVE_001
+ * @brief Receive bindings are bounded and the default layout is stripped before delivery
+ */
+TEST_F(E2ETest, ReceiveTableRejectsCapacityAndStripsDefaultHeader) {
+    E2EReceiveTable table;
+    E2EReceiveBinding bad;
+    bad.service_id = 0;
+    bad.method_id = 1;
+    EXPECT_EQ(table.add(bad), Result::INVALID_ARGUMENT);
+
+    E2EReceiveBinding binding;
+    binding.service_id = 0x1234;
+    binding.method_id = 0x0007;
+    binding.data_id = 0x0100;
+    binding.policy = E2EReceivePolicy::STACK_MANAGED;
+    binding.enable_freshness = false;
+    for (size_t i = 0; i < MAX_E2E_RECEIVE_BINDINGS; ++i) {
+        binding.method_id = static_cast<uint16_t>(i + 1);
+        EXPECT_EQ(table.add(binding), Result::SUCCESS);
+    }
+    binding.method_id = 0x00FF;
+    EXPECT_EQ(table.add(binding), Result::RESOURCE_EXHAUSTED);
+
+    E2EReceiveTable one;
+    binding.method_id = 0x0007;
+    binding.data_id = 0x0100;
+    ASSERT_EQ(one.add(binding), Result::SUCCESS);
+    EXPECT_EQ(one.add(binding), Result::INVALID_ARGUMENT);
+
+    Message original(MessageId(0x1234, 0x0007), RequestId(0x0001, 0x0001), MessageType::REQUEST,
+                     ReturnCode::E_OK);
+    const platform::ByteBuffer payload{0x11, 0x22, 0x33};
+    original.set_payload(payload);
+    E2EConfig config(0x0100);
+    config.enable_freshness = false;
+    E2EProtection protection;
+    ASSERT_EQ(protection.protect(original, config), Result::SUCCESS);
+    platform::ByteBuffer wire = original.serialize();
+
+    Message received;
+    E2EReceiveOutcome outcome = receive_if_e2e_protected(one, wire.data(), wire.size(), received);
+    EXPECT_EQ(outcome.status, E2EReceiveStatus::ACCEPTED);
+    EXPECT_EQ(received.get_payload(), payload);
+    EXPECT_TRUE(received.has_e2e_header());
+    ASSERT_TRUE(received.get_e2e_header().has_value());
+    EXPECT_EQ(protection.validate(received, config), Result::SUCCESS);
+
+    wire[wire.size() - 1] ^= 0xFFU;
+    Message corrupted;
+    outcome = receive_if_e2e_protected(one, wire.data(), wire.size(), corrupted);
+    EXPECT_EQ(outcome.status, E2EReceiveStatus::REJECTED);
+    EXPECT_TRUE(outcome.integrity_failure);
+    EXPECT_EQ(outcome.result, Result::INVALID_ARGUMENT);
+
+    E2EReceiveTable app;
+    binding.policy = E2EReceivePolicy::APPLICATION_MANAGED;
+    ASSERT_EQ(app.add(binding), Result::SUCCESS);
+    platform::ByteBuffer app_wire = original.serialize();
+    app_wire[app_wire.size() - 1] ^= 0xFFU;
+    Message app_msg;
+    outcome = receive_if_e2e_protected(app, app_wire.data(), app_wire.size(), app_msg);
+    EXPECT_EQ(outcome.status, E2EReceiveStatus::ACCEPTED);
+    EXPECT_EQ(app_msg.get_payload().size(), payload.size());
+    EXPECT_TRUE(app_msg.has_e2e_header());
+    EXPECT_EQ(protection.validate(app_msg, config), Result::INVALID_ARGUMENT);
+}
+
+/**
+ * @test_case TC_E2E_RX_002
+ * @tests REQ_E2E_RECEIVE_001
+ * @brief Stack-managed receive uses the binding counter limit, not the E2EConfig default
+ */
+TEST_F(E2ETest, ReceiveBindingUsesCounterLimit) {
+    constexpr uint16_t data_id = 0xBEEF;
+    E2EConfig sender(data_id);
+    sender.max_counter_value = 20;
+    sender.enable_freshness = false;
+    E2EProtection protection;
+    platform::ByteBuffer wire;
+    for (uint16_t i = 0; i < 15; ++i) {
+        Message msg(MessageId(0x1234, 0x0009), RequestId(0x0001, i), MessageType::REQUEST,
+                    ReturnCode::E_OK);
+        msg.set_payload(platform::ByteBuffer{0x01});
+        ASSERT_EQ(protection.protect(msg, sender), Result::SUCCESS);
+        wire = msg.serialize();
+    }
+    ASSERT_TRUE(E2EProfileRegistry::instance().unregister_profile(0));
+
+    E2EReceiveBinding tight;
+    tight.service_id = 0x1234;
+    tight.method_id = 0x0009;
+    tight.data_id = data_id;
+    tight.max_counter_value = 10;
+    tight.freshness_timeout_ms = 50;
+    tight.enable_freshness = false;
+    E2EReceiveTable tight_table;
+    ASSERT_EQ(tight_table.add(tight), Result::SUCCESS);
+    Message rejected;
+    E2EReceiveOutcome outcome =
+        receive_if_e2e_protected(tight_table, wire.data(), wire.size(), rejected);
+    EXPECT_EQ(outcome.status, E2EReceiveStatus::REJECTED);
+    EXPECT_TRUE(outcome.integrity_failure);
+    EXPECT_EQ(outcome.result, Result::INVALID_ARGUMENT);
+
+    E2EReceiveBinding wide = tight;
+    wide.max_counter_value = 20;
+    E2EReceiveTable wide_table;
+    ASSERT_EQ(wide_table.add(wide), Result::SUCCESS);
+    Message accepted;
+    outcome = receive_if_e2e_protected(wide_table, wire.data(), wire.size(), accepted);
+    EXPECT_EQ(outcome.status, E2EReceiveStatus::ACCEPTED);
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_004
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests REQ_MSG_011
+ * @tests feat_req_someip_77
+ * @tests feat_req_someip_102
+ * @brief Byte-aligned Offset 128 places the header at wire byte 24 and keeps the prefix out of the
+ * payload
+ */
+TEST_F(E2ETest, NonDefaultByteAlignedOffsetRoundTrip) {
+    constexpr uint32_t kOffsetBits = 128;  // 8 bytes after Return Code
+    const uint8_t prefix[8] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17};
+
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x5678), RequestId(0x0001, 0x0001));
+    msg.set_payload(platform::ByteBuffer{0xAA, 0xBB});
+    ASSERT_EQ(msg.set_e2e_unprotected_prefix(kOffsetBits, prefix, sizeof(prefix)), Result::SUCCESS);
+    ASSERT_EQ(msg.set_e2e_unprotected_prefix(kOffsetBits, msg.e2e_unprotected_prefix(),
+                                             msg.e2e_unprotected_prefix_size()),
+              Result::SUCCESS);
+    EXPECT_EQ(std::memcmp(msg.e2e_unprotected_prefix(), prefix, sizeof(prefix)), 0);
+
+    E2EConfig config(0x1234);
+    config.offset_bits = kOffsetBits;
+    ASSERT_EQ(protection.protect(msg, config), Result::SUCCESS);
+    ASSERT_TRUE(msg.has_e2e_header());
+    EXPECT_EQ(msg.e2e_offset_bits(), kOffsetBits);
+    EXPECT_EQ(msg.get_payload().size(), 2u);
+    EXPECT_EQ(msg.get_payload()[0], 0xAA);
+    EXPECT_EQ(msg.e2e_unprotected_prefix_size(), 8u);
+    EXPECT_EQ(std::memcmp(msg.e2e_unprotected_prefix(), prefix, sizeof(prefix)), 0);
+
+    const uint32_t expected_length =
+        8U + 8U + static_cast<uint32_t>(E2EHeader::get_header_size()) + 2U;
+    EXPECT_EQ(msg.get_length(), expected_length);
+
+    platform::ByteBuffer const wire = msg.serialize();
+    const size_t header_index = e2e_header_wire_index(kOffsetBits);
+    EXPECT_EQ(header_index, 24u);
+    ASSERT_EQ(wire.size(), 8u + expected_length);
+    EXPECT_EQ(wire[4], static_cast<uint8_t>((expected_length >> 24) & 0xFF));
+    EXPECT_EQ(wire[7], static_cast<uint8_t>(expected_length & 0xFF));
+    EXPECT_EQ(std::memcmp(wire.data() + 16, prefix, sizeof(prefix)), 0);
+
+    E2EHeader on_wire;
+    ASSERT_TRUE(on_wire.deserialize(wire, header_index));
+    EXPECT_EQ(on_wire.data_id, 0x1234u);
+    EXPECT_EQ(wire[header_index + E2EHeader::get_header_size()], 0xAA);
+    EXPECT_EQ(wire[header_index + E2EHeader::get_header_size() + 1], 0xBB);
+
+    E2EParseOptions options;
+    options.present = true;
+    options.offset_bits = kOffsetBits;
+    options.header_size = E2EHeader::get_header_size();
+    Message decoded;
+    ASSERT_EQ(decoded.try_deserialize(wire, options), Result::SUCCESS);
+    EXPECT_EQ(decoded.get_payload().size(), 2u);
+    EXPECT_EQ(decoded.get_payload()[0], 0xAA);
+    EXPECT_EQ(decoded.e2e_unprotected_prefix_size(), 8u);
+    ASSERT_TRUE(decoded.get_e2e_header().has_value());
+    EXPECT_EQ(decoded.get_e2e_header()->data_id, 0x1234u);
+    EXPECT_EQ(protection.validate(decoded, config), Result::SUCCESS);
+
+    Message copy = decoded;
+    EXPECT_EQ(copy.get_payload().size(), 2u);
+    EXPECT_EQ(copy.e2e_offset_bits(), kOffsetBits);
+
+    // expect_e2e alone is the default layout and must not be used to guess Offset.
+    Message default_layout;
+    ASSERT_EQ(default_layout.try_deserialize(wire, /*expect_e2e=*/true), Result::SUCCESS);
+    EXPECT_NE(default_layout.get_payload().size(), 2u);
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_005
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests feat_req_someip_102
+ * @brief A byte-aligned Offset whose prefix exceeds the static cap is NOT_IMPLEMENTED
+ */
+TEST_F(E2ETest, HugeByteAlignedOffsetIsNotImplemented) {
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x5678), RequestId(0x0001, 0x0001));
+    msg.set_payload(platform::ByteBuffer{0x01});
+
+    E2EConfig config(0x1234);
+    config.offset_bits =
+        E2EConfig::DEFAULT_OFFSET_BITS + static_cast<uint32_t>((MAX_E2E_PREFIX_SIZE + 1) * 8U);
+    EXPECT_EQ(protection.protect(msg, config), Result::NOT_IMPLEMENTED);
+    EXPECT_EQ(protection.validate(msg, config), Result::NOT_IMPLEMENTED);
+    EXPECT_EQ(msg.set_e2e_unprotected_prefix(config.offset_bits, nullptr, MAX_E2E_PREFIX_SIZE + 1),
+              Result::NOT_IMPLEMENTED);
+    EXPECT_FALSE(msg.has_e2e_header());
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_006
+ * @tests REQ_E2E_PLUGIN_005
+ * @tests REQ_MSG_011
+ * @tests feat_req_someip_77
+ * @tests feat_req_someip_103
+ * @brief A mock profile whose header is not 12 bytes round-trips without entering the payload
+ */
+TEST_F(E2ETest, NonTwelveByteProfileRoundTrip) {
+    constexpr uint32_t kProfileId = 0xE2E00008;
+    constexpr size_t kHeaderSize = 8;
+    E2EProfileRegistry& registry = E2EProfileRegistry::instance();
+    registry.unregister_profile(kProfileId);
+    ASSERT_TRUE(registry.register_profile(
+        std::make_unique<FixedSizeProfile>(kHeaderSize, kProfileId, "fixed8")));
+
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x0001), RequestId(0x0001, 0x0002));
+    msg.set_payload(platform::ByteBuffer{0x01, 0x02, 0x03});
+
+    E2EConfig config(0x00AB);
+    config.profile_id = kProfileId;
+    config.profile_name = "fixed8";
+    ASSERT_EQ(protection.protect(msg, config), Result::SUCCESS);
+    EXPECT_TRUE(msg.has_e2e_header());
+    EXPECT_EQ(msg.e2e_header_size(), kHeaderSize);
+    EXPECT_FALSE(msg.get_e2e_header().has_value());
+    EXPECT_EQ(msg.get_payload().size(), 3u);
+    EXPECT_EQ(msg.get_payload()[0], 0x01);
+    EXPECT_EQ(msg.e2e_header_bytes()[0], 0xA5);
+
+    const uint32_t expected_length = 8U + static_cast<uint32_t>(kHeaderSize) + 3U;
+    EXPECT_EQ(msg.get_length(), expected_length);
+
+    platform::ByteBuffer const wire = msg.serialize();
+    ASSERT_EQ(wire.size(), 16u + kHeaderSize + 3u);
+    EXPECT_EQ(wire[16], 0xA5);
+    EXPECT_EQ(wire[16 + kHeaderSize], 0x01);
+
+    E2EParseOptions options;
+    options.present = true;
+    options.offset_bits = E2EConfig::DEFAULT_OFFSET_BITS;
+    options.header_size = kHeaderSize;
+    Message decoded;
+    ASSERT_EQ(decoded.try_deserialize(wire, options), Result::SUCCESS);
+    EXPECT_EQ(decoded.get_payload().size(), 3u);
+    EXPECT_EQ(decoded.get_payload()[0], 0x01);
+    EXPECT_EQ(decoded.get_payload()[2], 0x03);
+    EXPECT_FALSE(decoded.get_e2e_header().has_value());
+    EXPECT_EQ(protection.validate(decoded, config), Result::SUCCESS);
+
+    E2EConfig wrong_id = config;
+    wrong_id.data_id = 0x00FF;
+    EXPECT_EQ(protection.validate(decoded, wrong_id), Result::INVALID_ARGUMENT);
+
+    EXPECT_TRUE(registry.unregister_profile(kProfileId));
+}
+
+/**
+ * @test_case TC_E2E_OFFSET_007
+ * @tests REQ_E2E_PLUGIN_005
+ * @brief No registered profile still wins over an illegal Offset
+ */
+TEST_F(E2ETest, MissingProfileBeatsIllegalOffset) {
+    E2EProfileRegistry& registry = E2EProfileRegistry::instance();
+    ASSERT_TRUE(registry.unregister_profile(0));
+
+    E2EProtection protection;
+    Message msg(MessageId(0x1234, 0x0001), RequestId(0x0001, 0x0001));
+    E2EConfig config(0x1234);
+    config.offset_bits = 8;
+    config.profile_name.clear();
+    EXPECT_EQ(protection.protect(msg, config), Result::NOT_INITIALIZED);
+    EXPECT_EQ(protection.validate(msg, config), Result::NOT_INITIALIZED);
+
+    initialize_basic_profile();
 }

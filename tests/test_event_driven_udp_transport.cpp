@@ -1,0 +1,481 @@
+/********************************************************************************
+ * Copyright (c) 2025 Vinicius Tadeu Zein
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ********************************************************************************/
+
+#include <gtest/gtest.h>
+#include <transport/event_driven_udp_transport.h>
+#include <transport/udp_socket_adapter.h>
+#include <transport/transport.h>
+#include <someip/message.h>
+#include <e2e/e2e_config.h>
+#include <e2e/e2e_protection.h>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+
+#include "static_pool_init.h"
+
+using namespace someip;
+using namespace someip::transport;
+
+namespace {
+
+class TestEventUdpListener : public ITransportListener {
+public:
+    void on_message_received(MessagePtr message, const Endpoint& sender) override {
+        std::scoped_lock lock(mutex_);
+        received_messages_.push_back({std::move(message), sender});
+        cv_.notify_one();
+    }
+
+    void on_connection_lost(const Endpoint& /*endpoint*/) override {}
+
+    void on_connection_established(const Endpoint& /*endpoint*/) override {}
+
+    void on_error(Result error) override {
+        std::scoped_lock lock(mutex_);
+        last_error_ = error;
+        error_count_++;
+        cv_.notify_one();
+    }
+
+    void on_message_rejected(const MessageRejectionInfo& info) override {
+        std::scoped_lock lock(mutex_);
+        rejections_.push_back(info);
+        cv_.notify_one();
+    }
+
+    bool wait_for_message(std::chrono::milliseconds timeout = std::chrono::milliseconds(500)) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this]() { return !received_messages_.empty(); });
+    }
+
+    bool wait_for_error(std::chrono::milliseconds timeout = std::chrono::milliseconds(500)) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this]() { return error_count_ > 0; });
+    }
+
+    size_t message_count() const {
+        std::scoped_lock lock(mutex_);
+        return received_messages_.size();
+    }
+
+    Endpoint message_sender(size_t index) const {
+        std::scoped_lock lock(mutex_);
+        return received_messages_.at(index).second;
+    }
+
+    uint16_t message_service_id(size_t index) const {
+        std::scoped_lock lock(mutex_);
+        return received_messages_.at(index).first->get_service_id();
+    }
+
+    uint16_t message_method_id(size_t index) const {
+        std::scoped_lock lock(mutex_);
+        return received_messages_.at(index).first->get_method_id();
+    }
+
+    const platform::ByteBuffer& message_payload(size_t index) const {
+        std::scoped_lock lock(mutex_);
+        return received_messages_.at(index).first->get_payload();
+    }
+
+    bool message_has_e2e(size_t index) const {
+        std::scoped_lock lock(mutex_);
+        return received_messages_.at(index).first->has_e2e_header();
+    }
+
+    bool wait_for_rejection(std::chrono::milliseconds timeout = std::chrono::milliseconds(500)) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this]() { return !rejections_.empty(); });
+    }
+
+    std::vector<MessageRejectionInfo> rejections() const {
+        std::scoped_lock lock(mutex_);
+        return rejections_;
+    }
+
+    std::atomic<Result> last_error_{Result::SUCCESS};
+    std::atomic<int> error_count_{0};
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::pair<MessagePtr, Endpoint>> received_messages_;
+    std::vector<MessageRejectionInfo> rejections_;
+};
+
+class MockUdpAdapter : public IUdpSocketAdapter {
+public:
+    void set_open_result(Result r) { open_result_ = r; }
+
+    Result open(const Endpoint& local_endpoint) override {
+        if (open_result_ != Result::SUCCESS) {
+            return open_result_;
+        }
+        open_ = true;
+        local_ = local_endpoint;
+        if (local_.get_port() == 0) {
+            local_.set_port(54321);
+        }
+        return Result::SUCCESS;
+    }
+
+    void close() override {
+        open_ = false;
+        cb_ = nullptr;
+    }
+
+    Result send(const platform::ByteBuffer& data, const Endpoint& destination) override {
+        last_send_data_ = data;
+        last_send_dest_ = destination;
+        return Result::SUCCESS;
+    }
+
+    Result join_multicast(const platform::String<>& multicast_address,
+                          const platform::String<>& /*interface_address*/) override {
+        joins_.push_back(multicast_address);
+        return join_result_;
+    }
+
+    Result leave_multicast(const platform::String<>& multicast_address,
+                           const platform::String<>& /*interface_address*/) override {
+        leaves_.push_back(multicast_address);
+        return leave_result_;
+    }
+
+    void set_receive_callback(UdpReceiveCallback callback) override { cb_ = std::move(callback); }
+
+    Endpoint get_local_endpoint() const override { return local_; }
+
+    void inject_receive(const platform::ByteBuffer& data, const Endpoint& sender) {
+        if (cb_) {
+            cb_(data, sender);
+        }
+    }
+
+    bool is_open() const { return open_; }
+
+    platform::ByteBuffer last_send_data_;
+    Endpoint last_send_dest_{"0.0.0.0", 0};
+    std::vector<platform::String<>> joins_;
+    std::vector<platform::String<>> leaves_;
+    Result join_result_{Result::SUCCESS};
+    Result leave_result_{Result::SUCCESS};
+
+private:
+    bool open_{false};
+    Endpoint local_{"127.0.0.1", 0};
+    UdpReceiveCallback cb_;
+    Result open_result_{Result::SUCCESS};
+};
+
+Message make_sample_message() {
+    Message message;
+    message.set_service_id(0x1234);
+    message.set_method_id(0x5678);
+    message.set_client_id(0x9ABC);
+    message.set_session_id(0xDEF0);
+    message.set_protocol_version(1);
+    message.set_interface_version(1);
+    message.set_message_type(MessageType::REQUEST);
+    message.set_return_code(ReturnCode::E_OK);
+    message.set_payload({0x01, 0x02, 0x03});
+    return message;
+}
+
+} // namespace
+
+TEST(EventDrivenUdpTransport, ConstructionNotRunning) {
+    MockUdpAdapter adapter;
+    Endpoint local{"127.0.0.1", 0};
+    EventDrivenUdpTransport transport(adapter, local);
+
+    EXPECT_FALSE(transport.is_running());
+    EXPECT_FALSE(transport.is_connected());
+    EXPECT_EQ(transport.get_local_endpoint().get_address(), "127.0.0.1");
+}
+
+TEST(EventDrivenUdpTransport, StartStopLifecycle) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+
+    EXPECT_EQ(transport.start(), Result::SUCCESS);
+    EXPECT_TRUE(transport.is_running());
+    EXPECT_TRUE(transport.is_connected());
+    EXPECT_TRUE(adapter.is_open());
+    EXPECT_EQ(transport.get_local_endpoint().get_port(), 54321);
+
+    EXPECT_EQ(transport.stop(), Result::SUCCESS);
+    EXPECT_FALSE(transport.is_running());
+    EXPECT_FALSE(adapter.is_open());
+}
+
+TEST(EventDrivenUdpTransport, StartPropagatesOpenFailure) {
+    MockUdpAdapter adapter;
+    adapter.set_open_result(Result::NETWORK_ERROR);
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 30490});
+
+    EXPECT_EQ(transport.start(), Result::NETWORK_ERROR);
+    EXPECT_FALSE(transport.is_running());
+}
+
+TEST(EventDrivenUdpTransport, SendForwardsToAdapter) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    Message msg = make_sample_message();
+    Endpoint dest{"127.0.0.1", 40000};
+    ASSERT_EQ(transport.send_message(msg, dest), Result::SUCCESS);
+
+    EXPECT_EQ(adapter.last_send_dest_, dest);
+    platform::ByteBuffer expected = msg.serialize();
+    EXPECT_EQ(adapter.last_send_data_, expected);
+
+    transport.stop();
+}
+
+TEST(EventDrivenUdpTransport, ReceiveCallbackNotifiesListener) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    TestEventUdpListener listener;
+    transport.set_listener(&listener);
+
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    Message sent = make_sample_message();
+    platform::ByteBuffer raw = sent.serialize();
+    Endpoint sender{"10.0.0.5", 5000, TransportProtocol::UDP};
+    adapter.inject_receive(raw, sender);
+
+    ASSERT_TRUE(listener.wait_for_message());
+    ASSERT_EQ(listener.message_count(), 1u);
+    EXPECT_EQ(listener.message_sender(0), sender);
+    EXPECT_EQ(listener.message_service_id(0), sent.get_service_id());
+
+    MessagePtr queued = transport.receive_message();
+    EXPECT_EQ(queued, nullptr);
+
+    transport.stop();
+}
+
+TEST(EventDrivenUdpTransport, MalformedDatagramInvokesOnError) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    TestEventUdpListener listener;
+    transport.set_listener(&listener);
+
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    adapter.inject_receive(platform::ByteBuffer{0x00, 0x01}, Endpoint{"127.0.0.1", 1234});
+
+    ASSERT_TRUE(listener.wait_for_error());
+    EXPECT_EQ(listener.last_error_.load(), Result::INVALID_MESSAGE);
+
+    transport.stop();
+}
+
+TEST(EventDrivenUdpTransport, MulticastJoinLeave) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    EXPECT_EQ(transport.join_multicast_group("224.0.0.251"), Result::SUCCESS);
+    EXPECT_EQ(transport.leave_multicast_group("224.0.0.251"), Result::SUCCESS);
+    ASSERT_EQ(adapter.joins_.size(), 1u);
+    ASSERT_EQ(adapter.leaves_.size(), 1u);
+    EXPECT_EQ(adapter.joins_[0], "224.0.0.251");
+    EXPECT_EQ(adapter.leaves_[0], "224.0.0.251");
+
+    transport.stop();
+}
+
+/**
+ * @tests REQ_TRANSPORT_011_E01
+ * @brief Adapter MULTICAST_ERROR is propagated, not rewritten as success
+ */
+TEST(EventDrivenUdpTransport, MulticastJoinFailurePropagates) {
+    MockUdpAdapter adapter;
+    adapter.join_result_ = Result::MULTICAST_ERROR;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    EXPECT_EQ(transport.join_multicast_group("224.0.0.251"), Result::MULTICAST_ERROR);
+    ASSERT_EQ(adapter.joins_.size(), 1u);
+
+    transport.stop();
+}
+
+TEST(EventDrivenUdpTransport, ConnectMulticastUdpJoinsAdapter) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    Endpoint mc("239.0.0.1", 30490, TransportProtocol::MULTICAST_UDP);
+    EXPECT_EQ(transport.connect(mc), Result::SUCCESS);
+    ASSERT_EQ(adapter.joins_.size(), 1u);
+    EXPECT_EQ(adapter.joins_[0], "239.0.0.1");
+
+    transport.stop();
+}
+
+TEST(EventDrivenUdpTransport, StopClearsReceiveCallback) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+    TestEventUdpListener listener;
+    transport.set_listener(&listener);
+
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+    transport.stop();
+
+    Message sent = make_sample_message();
+    adapter.inject_receive(sent.serialize(), Endpoint{"127.0.0.1", 1});
+
+    EXPECT_FALSE(listener.wait_for_message(std::chrono::milliseconds(50)));
+}
+
+TEST(EventDrivenUdpTransport, MulticastBeforeStart) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+
+    EXPECT_EQ(transport.join_multicast_group("224.0.0.1"), Result::NOT_CONNECTED);
+    EXPECT_EQ(transport.leave_multicast_group("224.0.0.1"), Result::NOT_CONNECTED);
+    EXPECT_EQ(transport.connect(Endpoint{"224.0.0.1", 30490, TransportProtocol::MULTICAST_UDP}),
+              Result::NOT_CONNECTED);
+    EXPECT_TRUE(adapter.joins_.empty());
+    EXPECT_TRUE(adapter.leaves_.empty());
+}
+
+/**
+ * @brief Listener may call stop() from on_message_received without deadlocking.
+ *
+ * Assumption: the adapter is single-threaded (callbacks are not concurrent) and
+ * clearing the receive callback from inside the active callback returns without
+ * waiting for that same callback to finish (see IUdpSocketAdapter quiescence).
+ */
+TEST(EventDrivenUdpTransport, StopFromListenerDoesNotDeadlock) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0});
+
+    class StoppingListener : public ITransportListener {
+    public:
+        explicit StoppingListener(EventDrivenUdpTransport& transport) : transport_(transport) {}
+
+        void on_message_received(MessagePtr /*message*/, const Endpoint& /*sender*/) override {
+            ++messages_;
+            stop_result_ = transport_.stop();
+            stopped_ = true;
+        }
+
+        void on_connection_lost(const Endpoint& /*endpoint*/) override {}
+        void on_connection_established(const Endpoint& /*endpoint*/) override {}
+        void on_error(Result /*error*/) override {}
+
+        EventDrivenUdpTransport& transport_;
+        int messages_{0};
+        bool stopped_{false};
+        Result stop_result_{Result::SUCCESS};
+    } listener(transport);
+
+    transport.set_listener(&listener);
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    adapter.inject_receive(make_sample_message().serialize(), Endpoint{"10.0.0.5", 5000});
+
+    EXPECT_EQ(listener.messages_, 1);
+    EXPECT_TRUE(listener.stopped_);
+    EXPECT_EQ(listener.stop_result_, Result::SUCCESS);
+    EXPECT_FALSE(transport.is_running());
+}
+
+TEST(EventDrivenUdpTransport, StackManagedE2ERejectsCorruption) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransportConfig cfg;
+    e2e::E2EReceiveBinding binding;
+    binding.service_id = 0x1234;
+    binding.method_id = 0x5678;
+    binding.data_id = 0x0100;
+    binding.policy = e2e::E2EReceivePolicy::STACK_MANAGED;
+    binding.enable_freshness = false;
+    ASSERT_EQ(cfg.e2e_receive.add(binding), Result::SUCCESS);
+
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0}, cfg);
+    TestEventUdpListener listener;
+    transport.set_listener(&listener);
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    Message sent = make_sample_message();
+    e2e::E2EConfig e2e_config(0x0100);
+    e2e_config.enable_freshness = false;
+    e2e::E2EProtection protection;
+    ASSERT_EQ(protection.protect(sent, e2e_config), Result::SUCCESS);
+    const platform::ByteBuffer payload = sent.get_payload();
+    adapter.inject_receive(sent.serialize(), Endpoint{"10.0.0.5", 5000});
+    ASSERT_TRUE(listener.wait_for_message());
+    EXPECT_EQ(listener.message_payload(0), payload);
+    EXPECT_TRUE(listener.message_has_e2e(0));
+    EXPECT_EQ(listener.error_count_.load(), 0);
+
+    platform::ByteBuffer flipped = sent.get_payload();
+    flipped[0] ^= 0xFFU;
+    sent.set_payload(flipped);
+    adapter.inject_receive(sent.serialize(), Endpoint{"10.0.0.5", 5000});
+    ASSERT_TRUE(listener.wait_for_rejection());
+    ASSERT_EQ(listener.rejections().size(), 1u);
+    EXPECT_EQ(listener.rejections()[0].stage, MessageRejectionStage::E2E_INTEGRITY);
+    EXPECT_EQ(listener.rejections()[0].message_id.service_id, 0x1234);
+    EXPECT_EQ(listener.rejections()[0].message_id.method_id, 0x5678);
+    EXPECT_EQ(listener.message_count(), 1u);
+
+    transport.stop();
+}
+
+/**
+ * @test_case TC_ED_UDP_E2E_002
+ * @tests REQ_E2E_RECEIVE_001, REQ_TRANSPORT_026
+ * @brief A bound datagram shorter than the SOME/IP header reports wire IDs.
+ */
+TEST(EventDrivenUdpTransport, BoundShortDatagramReportsWireIds) {
+    MockUdpAdapter adapter;
+    EventDrivenUdpTransportConfig cfg;
+    e2e::E2EReceiveBinding binding;
+    binding.service_id = 0x1234;
+    binding.method_id = 0x5678;
+    binding.policy = e2e::E2EReceivePolicy::STACK_MANAGED;
+    ASSERT_EQ(cfg.e2e_receive.add(binding), Result::SUCCESS);
+
+    EventDrivenUdpTransport transport(adapter, Endpoint{"127.0.0.1", 0}, cfg);
+    TestEventUdpListener listener;
+    transport.set_listener(&listener);
+    ASSERT_EQ(transport.start(), Result::SUCCESS);
+
+    // Twelve bytes stop try_deserialize before it writes Message IDs.
+    adapter.inject_receive(platform::ByteBuffer{0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x04,
+                                                 0x00, 0x11, 0x00, 0x22},
+                            Endpoint{"10.0.0.5", 5000});
+    ASSERT_TRUE(listener.wait_for_rejection());
+    const std::vector<MessageRejectionInfo> rejections = listener.rejections();
+    ASSERT_EQ(rejections.size(), 1u);
+    const MessageRejectionInfo& info = rejections[0];
+    EXPECT_EQ(info.stage, MessageRejectionStage::DESERIALIZE);
+    EXPECT_EQ(info.result, Result::MALFORMED_MESSAGE);
+    EXPECT_TRUE(info.has_message_id);
+    EXPECT_EQ(info.message_id.service_id, 0x1234);
+    EXPECT_EQ(info.message_id.method_id, 0x5678);
+    EXPECT_TRUE(info.has_request_id);
+    EXPECT_EQ(info.request_id.client_id, 0x0011);
+    EXPECT_EQ(info.request_id.session_id, 0x0022);
+    EXPECT_EQ(listener.message_count(), 0u);
+
+    transport.stop();
+}

@@ -20,6 +20,7 @@
 #include "platform/containers.h"
 
 #include <array>
+#include <bitset>
 #include <variant>
 
 namespace someip::sd {
@@ -124,6 +125,15 @@ public:
     uint16_t get_reserved_12bit() const { return reserved_12bit_; }
     void set_reserved_12bit(uint16_t reserved) { reserved_12bit_ = static_cast<uint16_t>(reserved & 0x0FFFU); }
 
+    /// Initial Data Requested flag (bit 3 of the 12-bit reserved field, wire bit 7 of byte 13).
+    bool get_initial_data_requested() const {
+        return (static_cast<uint32_t>(reserved_12bit_) & 0x0008U) != 0U;
+    }
+    void set_initial_data_requested(bool requested) {
+        const auto cleared = static_cast<uint16_t>(static_cast<uint32_t>(reserved_12bit_) & ~0x0008U);
+        reserved_12bit_ = requested ? static_cast<uint16_t>(static_cast<uint32_t>(cleared) | 0x0008U) : cleared;
+    }
+
     uint8_t get_counter() const { return counter_; }
     void set_counter(uint8_t counter) { counter_ = static_cast<uint8_t>(counter & 0x0FU); }
 
@@ -194,6 +204,28 @@ private:
     uint8_t protocol_{0};
     uint32_t ipv4_address_{0};
     uint16_t port_{0};
+};
+
+/**
+ * @brief IPv4 SD Endpoint Option (Type 0x24, Length 0x0009).
+ *
+ * Same wire layout as IPv4 Endpoint Option. The type marks the sender's SD
+ * endpoint, which is not an application/event endpoint and is not referenced
+ * by entries.
+ *
+ * @implements REQ_SD_122, REQ_SD_236
+ * @satisfies feat_req_someipsd_1085, feat_req_someipsd_1086, feat_req_someipsd_1087
+ */
+class IPv4SdEndpointOption : public IPv4EndpointOption {
+public:
+    IPv4SdEndpointOption() {
+        type_ = OptionType::IPV4_SD_ENDPOINT;
+    }
+    ~IPv4SdEndpointOption() override = default;
+    IPv4SdEndpointOption(const IPv4SdEndpointOption&) = default;
+    IPv4SdEndpointOption& operator=(const IPv4SdEndpointOption&) = default;
+    IPv4SdEndpointOption(IPv4SdEndpointOption&&) noexcept = default;
+    IPv4SdEndpointOption& operator=(IPv4SdEndpointOption&&) noexcept = default;
 };
 
 /**
@@ -322,6 +354,7 @@ private:
 using SdEntryStorage = std::variant<ServiceEntry, EventGroupEntry>;
 using SdOptionStorage = std::variant<ConfigurationOption,
                                      IPv4EndpointOption,
+                                     IPv4SdEndpointOption,
                                      IPv4MulticastOption,
                                      IPv6EndpointOption,
                                      IPv6MulticastOption>;
@@ -364,6 +397,10 @@ public:
     // Helper methods
     bool is_reboot() const { return (static_cast<uint32_t>(flags_) & 0x80U) != 0; }
     bool is_unicast() const { return (static_cast<uint32_t>(flags_) & 0x40U) != 0; }
+    /// Explicit Initial Data Control Flag (third-highest SD header bit, 0x20).
+    bool explicit_initial_data_control() const {
+        return (static_cast<uint32_t>(flags_) & 0x20U) != 0U;
+    }
 
     uint16_t get_session_id() const { return session_id_; }
     void set_session_id(uint16_t id) { session_id_ = id; }
@@ -386,10 +423,44 @@ public:
         }
     }
 
+    void set_explicit_initial_data_control(bool enabled) {
+        if (enabled) {
+            flags_ = static_cast<uint8_t>(static_cast<uint32_t>(flags_) | 0x20U);
+        } else {
+            flags_ = static_cast<uint8_t>(static_cast<uint32_t>(flags_) & ~0x20U);
+        }
+    }
+
+    /**
+     * @brief First-on-the-wire IPv4 SD Endpoint Option, if it can be used.
+     *
+     * Wire position is the option array index before unsupported options are
+     * skipped. A later 0x24 is ignored. UDP, a non-zero port, and a unicast
+     * address are required; multicast, broadcast, and the unspecified address
+     * do not replace the datagram source.
+     *
+     * @implements REQ_SD_236, REQ_SD_343
+     * @satisfies feat_req_someipsd_1151, feat_req_someipsd_1152
+     */
+    bool ipv4_sd_endpoint(platform::String<>& address, uint16_t& port) const;
+
+    /**
+     * @brief True when an entry option run includes an IPv4 SD Endpoint Option.
+     * @implements REQ_SD_343
+     * @satisfies feat_req_someipsd_1114
+     */
+    bool entry_references_ipv4_sd_endpoint(const SdEntry& entry) const;
+
 private:
     uint8_t flags_{0};
     uint32_t reserved_{0};
     uint16_t session_id_{0};
+    /// True after deserialize has recorded option wire indexes.
+    bool option_wire_index_valid_{false};
+    /// True when wire index 0 was an IPv4 SD Endpoint Option.
+    bool ipv4_sd_endpoint_wire_first_{false};
+    /// Wire indexes of type 0x24 options. An entry index is 8 bits, so every index fits.
+    std::bitset<256> ipv4_sd_endpoint_wire_bits_;
 
     platform::Vector<SdEntryStorage> entries_;
     platform::Vector<SdOptionStorage> options_;
@@ -404,6 +475,30 @@ private:
 inline void apply_sd_tx_flags(SdMessage& message, const SdSessionIdCounter& counter) {
     message.set_unicast(true);
     message.set_reboot(counter.reboot_flag());
+    // Advertise explicit initial-data control only because client and server
+    // both implement the feature. Reserved flag bits stay clear on serialize.
+    message.set_explicit_initial_data_control(true);
+}
+
+/**
+ * @brief Reboot detection for one SD communication channel.
+ *
+ * A channel is the resolved SD endpoint (IPv4 SD Endpoint Option when it is
+ * usable, otherwise the datagram source), not the outer address alone.
+ * Multicast and unicast reception on that endpoint are separate streams.
+ *
+ * @implements REQ_SD_1084, REQ_SD_343
+ * @satisfies feat_req_someipsd_1084, feat_req_someipsd_764
+ */
+inline bool sd_reboot_detected(bool have_previous, bool previous_reboot, uint16_t previous_session,
+                               bool incoming_reboot, uint16_t incoming_session) {
+    if (!have_previous) {
+        return false;
+    }
+    if (!previous_reboot && incoming_reboot) {
+        return true;
+    }
+    return previous_reboot && incoming_reboot && previous_session >= incoming_session;
 }
 
 // Type aliases for convenience

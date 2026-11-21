@@ -10,7 +10,7 @@
 **Implementation Status**: ✅ **COMPLIANT**
 - **Location**: `src/someip/message.cpp:142-146`
 - **Implementation**: E2E header is inserted after Return Code in `serialize()` method
-- **Offset Support**: Configurable via `E2EConfig::offset` (default 8 bytes = 64 bits)
+- **Offset Support**: `E2EConfig::offset_bits` is the spec Offset in bits from the Length-covered region; default 64 (wire byte 16). Byte-aligned Offsets of at least 64 are serialized. Overlap and non-byte alignment return `INVALID_ARGUMENT`. Prefixes above `SOMEIP_MAX_E2E_PREFIX_SIZE` return `NOT_IMPLEMENTED`
 - **Verification**: ✅ Header inserted correctly in serialization
 
 #### feat_req_someip_103: E2E Header Format
@@ -18,7 +18,7 @@
 
 **Implementation Status**: ✅ **COMPLIANT**
 - **Location**: `include/e2e/e2e_header.h`, `src/e2e/e2e_header.cpp`
-- **Implementation**: Variable-size E2E header structure (12 bytes standard format)
+- **Implementation**: Basic profile is 12 bytes. `Message` stores any profile header up to `SOMEIP_MAX_E2E_HEADER_SIZE` (64). Larger headers return `NOT_IMPLEMENTED`
 - **Format**: CRC (32-bit), Counter (32-bit), Data ID (16-bit), Freshness (16-bit)
 - **Extensibility**: Plugin architecture allows different profile formats
 - **Verification**: ✅ Header format matches spec requirements
@@ -105,11 +105,19 @@
 ## Specification Compliance Checklist
 
 ### Header Format Compliance
-- [x] E2E header inserted after Return Code
-- [x] Default offset of 64 bits (8 bytes) supported
-- [x] Configurable offset supported
-- [x] Variable-size header format supported
+- [x] Default layout: E2E header inserted after Return Code
+- [x] Default offset of 64 bits (8 bytes) from the Length-covered region
 - [x] Header included in Length field calculation
+
+### Known deviations from the specification
+- [x] `feat_req_someip_102` variable Offset: byte-aligned Offsets of at least
+      64 bits round-trip. The gap after Return Code is an unprotected prefix,
+      not application payload. Overlap (`offset_bits < 64`) and non-multiples
+      of 8 return `INVALID_ARGUMENT`. Prefixes above
+      `SOMEIP_MAX_E2E_PREFIX_SIZE` return `NOT_IMPLEMENTED` (no bit packing).
+- [x] `feat_req_someip_103` variable profile header size: plugins may use any
+      size up to `SOMEIP_MAX_E2E_HEADER_SIZE`. Larger sizes return
+      `NOT_IMPLEMENTED`. The 12-byte `E2EHeader` view is only for that size.
 
 ### Data Protection Compliance
 - [x] CRC calculation for data integrity

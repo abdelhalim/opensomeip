@@ -54,10 +54,14 @@ and can be overridden via CMake `-D` flags or CMakePresets cache variables.
 |---|---|---|
 | `SOMEIP_MESSAGE_POOL_SIZE` | 16 | Max concurrent `Message` objects |
 | `SOMEIP_BYTE_POOL_SMALL_COUNT` | 32 | Small buffer slots (256 B each) |
-| `SOMEIP_BYTE_POOL_MEDIUM_COUNT` | 16 | Medium buffer slots (1500 B each) |
+| `SOMEIP_BYTE_POOL_MEDIUM_COUNT` | 16 | Medium buffer slots (1600 B each) |
+| `SOMEIP_MAX_E2E_HEADER_SIZE` | 64 | Max E2E profile header stored in `Message` |
+| `SOMEIP_MAX_E2E_PREFIX_SIZE` | 64 | Max unprotected bytes between Return Code and the E2E header |
+| `SOMEIP_MAX_MESSAGE_SIZE` | 1544 | 16 + prefix cap + header cap + `SOMEIP_MAX_PAYLOAD_SIZE` |
 | `SOMEIP_BYTE_POOL_LARGE_COUNT` | 4 | Large buffer slots (64 KB each) |
 | `SOMEIP_BYTE_POOL_LARGE_SIZE` | 65536 | Large buffer tier size |
 | `SOMEIP_MAX_TP_SEGMENTS` | 64 | Max TP segments per transfer |
+| `SOMEIP_MAX_TCP_CONNECTIONS` | 10 | TCP connection table size (static builds). Each served peer may hold a large-tier receive buffer, so raising this usually means raising `SOMEIP_BYTE_POOL_LARGE_COUNT` too (default large-tier count is 4). |
 | `SOMEIP_MAX_TP_REASSEMBLY_SIZE` | 2048 | Max TP reassembly byte tracking |
 | `SOMEIP_DEFAULT_MAP_CAPACITY` | 32 | Default `UnorderedMap` capacity |
 | `SOMEIP_DEFAULT_VECTOR_CAPACITY` | 32 | Default `Vector` capacity |
@@ -118,6 +122,15 @@ heap intentionally:
 
 These are not called on the hot path and do not violate the zero-heap
 guarantee for message allocation, serialization, and transport operations.
+
+### Event-driven transports
+
+`EventDrivenUdpTransport` and `EventDrivenTcpTransport` are static-alloc
+compatible: they use `platform::` containers (`ByteBuffer`, `Queue`,
+`Function`, …) and deliver or enqueue one complete frame at a time. They do
+not stage unbounded `std::vector<MessagePtr>` bursts on the receive path.
+Pool exhaustion on TCP consumes the current complete frame and reports
+`OUT_OF_MEMORY` via `on_error` so the stream is not stalled.
 
 ## 5. Thread Safety
 

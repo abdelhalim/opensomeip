@@ -14,9 +14,13 @@
 #ifndef SOMEIP_RPC_CLIENT_H
 #define SOMEIP_RPC_CLIENT_H
 
-#include "rpc/rpc_types.h"
 #include "platform/buffer_pool.h"
+#include "rpc/rpc_types.h"
 #include "transport/endpoint.h"
+#include "transport/message_rejection.h"
+#include "transport/transport.h"
+
+#include <cstddef>
 
 #ifdef SOMEIP_STATIC_ALLOC
 #include "static_config.h"
@@ -50,6 +54,17 @@ public:
                        const transport::Endpoint& local_bind = transport::Endpoint("0.0.0.0", 0));
 
     /**
+     * @brief Borrow an exclusive, stopped transport instead of creating UDP.
+     * @param client_id Unique client identifier.
+     * @param transport Must outlive this client; the client manages start/stop.
+     * @param interface_version Service major / Interface Version for outgoing calls.
+     * @note Local binding and transport configuration belong to the supplied backend.
+     * @see transport::ITransport for the injected-transport lifecycle contract.
+     */
+    RpcClient(uint16_t client_id, transport::ITransport& transport,
+              uint8_t interface_version = 0x01);
+
+    /**
      * @brief Destructor
      */
     ~RpcClient();
@@ -68,8 +83,19 @@ public:
 
     /**
      * @brief Shutdown the RPC client
+     * @note All pending synchronous calls are completed before application callbacks run.
+     *       Explicit shutdown attempts every pending application callback; a callback that
+     *       throws is caught and discarded so this function never throws (safe to call from
+     *       an application RAII wrapper's destructor).
      */
     void shutdown();
+
+    /**
+     * @brief Result of the last transport start/stop (including failed-start cleanup).
+     * @return SUCCESS initially, otherwise the last lifecycle outcome; not a receive error.
+     * @note Safe to query during initialize/shutdown; object destruction must be serialized.
+     */
+    Result get_transport_result() const;
 
     /**
      * @brief Set the default destination for method calls
@@ -91,6 +117,12 @@ public:
      * @param parameters Serialized method parameters
      * @param timeout Call timeout configuration
      * @return Synchronous result with return values or error
+     * @note Completion and timeout removal are serialized under the pending-call mutex;
+     *       an already completed response wins over timeout. No application-callback
+     *       lifetime drain is performed. Join outstanding calls before destroying the client.
+     *       The response-time budget starts after the request has been handed to the
+     *       transport (i.e. once the, possibly blocking, send completes); the reported
+     *       elapsed time reflects only the wait for a reply, not the send duration.
      */
     RpcSyncResult call_method_sync(uint16_t service_id, MethodId method_id,
                                    const platform::ByteBuffer& parameters,
@@ -98,6 +130,7 @@ public:
 
     /**
      * @brief Synchronous RPC method call to an explicit service endpoint
+     * @note Uses the same completion/timeout arbitration as the configured-endpoint overload.
      */
     RpcSyncResult call_method_sync(uint16_t service_id, MethodId method_id,
                                    const platform::ByteBuffer& parameters,
@@ -156,6 +189,26 @@ public:
     bool is_ready() const;
 
     /**
+     * @brief Entries currently stored in this client's session table.
+     *
+     * A completed call removes its session before the call returns to the
+     * application. The count is the number of sessions still held for
+     * outstanding calls, not the number of calls this client has finished.
+     */
+    size_t session_count() const;
+
+    /**
+     * @brief Observe structural rejections of incoming messages.
+     *
+     * Additive; default is no handler. Invoked on the transport receive
+     * thread. Does not send a SOME/IP error response.
+     *
+     * @implements REQ_TRANSPORT_026
+     */
+    void set_message_rejection_handler(
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler);
+
+    /**
      * @brief Get client statistics
      *
      * @return Statistics about RPC calls (success rate, timing, etc.)
@@ -171,6 +224,7 @@ public:
 
 private:
 #ifdef SOMEIP_STATIC_ALLOC
+    /** @implements REQ_PLATFORM_STATIC_005 */
     alignas(alignof(std::max_align_t)) char impl_storage_[SOMEIP_PIMPL_RPCCLIENT_SIZE];
     RpcClientImpl* impl() noexcept { return reinterpret_cast<RpcClientImpl*>(impl_storage_); }
     const RpcClientImpl* impl() const noexcept { return reinterpret_cast<const RpcClientImpl*>(impl_storage_); }

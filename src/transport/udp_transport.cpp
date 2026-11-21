@@ -23,6 +23,7 @@
 #include "tp/tp_manager.h"
 #include "tp/tp_types.h"
 #include "transport/endpoint.h"
+#include "transport/message_rejection.h"
 #include "transport/transport.h"
 
 #include <array>
@@ -48,8 +49,23 @@ UdpTransport::UdpTransport(const Endpoint& local_endpoint, const UdpTransportCon
     : local_endpoint_(local_endpoint),
       config_(config),
       running_(false) {
+    if (config_.enable_tp && config_.max_message_size > 0) {
+        const size_t budget = config_.max_message_size;
+        config_.tp_config.max_single_datagram_size =
+            budget > static_cast<size_t>(UINT32_MAX)
+                ? UINT32_MAX
+                : static_cast<uint32_t>(budget);
+    }
     if (config_.enable_tp) {
-        const size_t min_rx = 20U + static_cast<size_t>(config_.tp_config.max_segment_size);
+        // A fitting message is one datagram, so the receive buffer has to hold
+        // that datagram. max_message_size 0 leaves the budget on
+        // tp_config.max_single_datagram_size instead of shrinking the buffer
+        // to the segment chunk.
+        const auto single =
+            static_cast<size_t>(config_.tp_config.max_single_datagram_size);
+        const size_t tp_datagram =
+            20U + static_cast<size_t>(config_.tp_config.max_segment_size);
+        const size_t min_rx = single > tp_datagram ? single : tp_datagram;
         if (config_.receive_buffer_size < min_rx) {
             config_.receive_buffer_size = min_rx;
         }
@@ -84,12 +100,8 @@ Result UdpTransport::send_message(const Message& message, const Endpoint& endpoi
         return Result::INVALID_ENDPOINT;
     }
 
-    if (config_.enable_tp && tp_manager_) {
-        const bool over_udp_max = config_.max_message_size > 0 &&
-            message.serialize().size() > config_.max_message_size;
-        if (tp_manager_->needs_segmentation(message) || over_udp_max) {
-            return send_tp_segments(message, endpoint);
-        }
+    if (config_.enable_tp && tp_manager_ && tp_manager_->needs_segmentation(message)) {
+        return send_tp_segments(message, endpoint);
     }
 
     const platform::ByteBuffer data = message.serialize();
@@ -207,6 +219,9 @@ Result UdpTransport::start() {
         return result;
     }
 
+    // Outgoing multicast uses the configured interface before any join.
+    apply_multicast_send_options();
+
     running_ = true;
     receive_thread_.emplace(&UdpTransport::receive_loop, this);
 
@@ -254,6 +269,15 @@ Result UdpTransport::join_multicast_group(const platform::String<>& multicast_ad
         return Result::INVALID_ENDPOINT;
     }
 
+    if (config_.injected_multicast_join_errno != 0) {
+        MulticastError error;
+        error.group_address = multicast_address;
+        error.interface_address = config_.multicast_interface;
+        error.system_error = config_.injected_multicast_join_errno;
+        last_multicast_error_ = error;
+        return Result::MULTICAST_ERROR;
+    }
+
     struct ip_mreq mreq = {};
     mreq.imr_multiaddr.s_addr = someip_inet_addr(multicast_address.c_str());
     if (!config_.multicast_interface.empty()) {
@@ -263,9 +287,11 @@ Result UdpTransport::join_multicast_group(const platform::String<>& multicast_ad
     }
 
     if (someip_setsockopt(socket_fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        // In containerized/CI environments, multicast may not be available
-        // Continue without multicast support rather than failing
+        record_multicast_error(multicast_address, config_.multicast_interface);
+        return Result::MULTICAST_ERROR;
     }
+
+    clear_multicast_error();
 
     // Enable multicast loopback for local testing
     int loop = 1;
@@ -312,9 +338,11 @@ Result UdpTransport::leave_multicast_group(const platform::String<>& multicast_a
     }
 
     if (someip_setsockopt(socket_fd_, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        return Result::NETWORK_ERROR;
+        record_multicast_error(multicast_address, config_.multicast_interface);
+        return Result::MULTICAST_ERROR;
     }
 
+    clear_multicast_error();
     return Result::SUCCESS;
 }
 
@@ -389,6 +417,33 @@ Result UdpTransport::create_socket() {
     return Result::SUCCESS;
 }
 
+void UdpTransport::apply_multicast_send_options() {
+    platform::ScopedLock const lock(socket_mutex_);
+    if (socket_fd_ == SOMEIP_INVALID_SOCKET) {
+        return;
+    }
+
+    // macOS accepts these options as unsigned char; Linux accepts int.
+    auto set_byte_option = [this](int option, int value) {
+        int const as_int = value;
+        if (someip_setsockopt(socket_fd_, IPPROTO_IP, option, &as_int, sizeof(as_int)) == 0) {
+            return;
+        }
+        auto const as_byte = static_cast<unsigned char>(value);
+        static_cast<void>(someip_setsockopt(socket_fd_, IPPROTO_IP, option, &as_byte, sizeof(as_byte)));
+    };
+
+    set_byte_option(IP_MULTICAST_LOOP, 1);
+    set_byte_option(IP_MULTICAST_TTL, config_.multicast_ttl);
+
+    if (!config_.multicast_interface.empty()) {
+        struct in_addr interface_addr = {};
+        interface_addr.s_addr = someip_inet_addr(config_.multicast_interface.c_str());
+        static_cast<void>(someip_setsockopt(socket_fd_, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr,
+                                            sizeof(interface_addr)));
+    }
+}
+
 /** @implements REQ_TRANSPORT_014, REQ_TRANSPORT_014_E01 */
 Result UdpTransport::bind_socket() {
     platform::ScopedLock const lock(socket_mutex_);
@@ -413,6 +468,12 @@ Result UdpTransport::configure_multicast(const Endpoint& endpoint) {
         return Result::INVALID_ENDPOINT;
     }
 
+    platform::ScopedLock const lock(socket_mutex_);
+
+    if (socket_fd_ == SOMEIP_INVALID_SOCKET) {
+        return Result::NOT_CONNECTED;
+    }
+
     struct ip_mreq mreq = {};
     mreq.imr_multiaddr.s_addr = someip_inet_addr(endpoint.get_address().c_str());
 
@@ -424,13 +485,33 @@ Result UdpTransport::configure_multicast(const Endpoint& endpoint) {
     }
 
     if (someip_setsockopt(socket_fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        return Result::NETWORK_ERROR;
+        record_multicast_error(endpoint.get_address(), config_.multicast_interface);
+        return Result::MULTICAST_ERROR;
     }
 
+    clear_multicast_error();
     return Result::SUCCESS;
 }
 
-/** @implements REQ_TRANSPORT_010, REQ_TP_091
+void UdpTransport::record_multicast_error(const platform::String<>& multicast_address,
+                                          const platform::String<>& interface_address) {
+    MulticastError error;
+    error.group_address = multicast_address;
+    error.interface_address = interface_address;
+    error.system_error = someip_socket_errno();
+    last_multicast_error_ = error;
+}
+
+void UdpTransport::clear_multicast_error() {
+    last_multicast_error_.reset();
+}
+
+std::optional<MulticastError> UdpTransport::last_multicast_error() const {
+    platform::ScopedLock const lock(socket_mutex_);
+    return last_multicast_error_;
+}
+
+/** @implements REQ_TRANSPORT_010, REQ_TP_091, REQ_TRANSPORT_026
  *  @satisfies feat_req_someiptp_785 */
 void UdpTransport::receive_loop() {
     platform::ByteBuffer buffer(config_.receive_buffer_size);
@@ -453,6 +534,12 @@ void UdpTransport::receive_loop() {
         if (result == Result::SUCCESS && bytes_received > 0) {
             MessagePtr const message = platform::allocate_message();
             if (!message) {
+                MessageRejectionInfo info;
+                info.sender = sender;
+                info.result = Result::OUT_OF_MEMORY;
+                info.stage = MessageRejectionStage::DESERIALIZE;
+                fill_rejection_ids(info, buffer.data(), bytes_received);
+                notify_rejection(info);
                 continue;
             }
 
@@ -463,12 +550,67 @@ void UdpTransport::receive_loop() {
 
             if (tp_datagram) {
                 const uint32_t sender_ipv4 = ntohl(someip_inet_addr(sender.get_address().c_str()));
+                Result ingest_error = Result::SUCCESS;
                 if (tp_manager_->ingest_datagram(buffer.data(), bytes_received, *message,
-                                                 sender_ipv4, sender.get_port())) {
-                    delivered = true;
+                                                 sender_ipv4, sender.get_port(),
+                                                 &ingest_error)) {
+                    // E2E is checked on the reassembled message, not on a segment.
+                    if (config_.e2e_receive.empty()) {
+                        delivered = true;
+                    } else {
+                        const platform::ByteBuffer wire = message->serialize();
+                        const e2e::E2EReceiveOutcome e2e_outcome = e2e::receive_if_e2e_protected(
+                            config_.e2e_receive, wire.data(), wire.size(), *message);
+                        if (e2e_outcome.status == e2e::E2EReceiveStatus::REJECTED) {
+                            MessageRejectionInfo info;
+                            info.sender = sender;
+                            info.result = e2e_outcome.result;
+                            info.stage = e2e_outcome.integrity_failure
+                                             ? MessageRejectionStage::E2E_INTEGRITY
+                                             : MessageRejectionStage::DESERIALIZE;
+                            fill_rejection_ids(info, *message, wire.size());
+                            notify_rejection(info);
+                        } else {
+                            delivered = true;
+                        }
+                    }
+                } else if (ingest_error != Result::SUCCESS) {
+                    MessageRejectionInfo info;
+                    info.sender = sender;
+                    info.result = ingest_error;
+                    info.stage = MessageRejectionStage::TP_REASSEMBLY;
+                    fill_rejection_ids(info, buffer.data(), bytes_received);
+                    notify_rejection(info);
                 }
-            } else if (message->deserialize(buffer.data(), bytes_received)) {
-                delivered = true;
+                // Incomplete reassembly is not a rejection; wait for more segments.
+            } else {
+                const e2e::E2EReceiveOutcome e2e_outcome = e2e::receive_if_e2e_protected(
+                    config_.e2e_receive, buffer.data(), bytes_received, *message);
+                if (e2e_outcome.status == e2e::E2EReceiveStatus::REJECTED) {
+                    MessageRejectionInfo info;
+                    info.sender = sender;
+                    info.result = e2e_outcome.result;
+                    info.stage = e2e_outcome.integrity_failure
+                                     ? MessageRejectionStage::E2E_INTEGRITY
+                                     : MessageRejectionStage::DESERIALIZE;
+                    // try_deserialize can fail before it writes Message IDs.
+                    if (e2e_outcome.integrity_failure) {
+                        fill_rejection_ids(info, *message, bytes_received);
+                    } else {
+                        fill_rejection_ids(info, buffer.data(), bytes_received);
+                    }
+                    notify_rejection(info);
+                } else if (e2e_outcome.status == e2e::E2EReceiveStatus::ACCEPTED ||
+                           message->deserialize(buffer.data(), bytes_received)) {
+                    delivered = true;
+                } else {
+                    MessageRejectionInfo info;
+                    info.sender = sender;
+                    info.result = Result::MALFORMED_MESSAGE;
+                    info.stage = MessageRejectionStage::DESERIALIZE;
+                    fill_rejection_ids(info, buffer.data(), bytes_received);
+                    notify_rejection(info);
+                }
             }
 
             if (delivered) {
@@ -497,6 +639,13 @@ void UdpTransport::receive_loop() {
                 platform::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
+    }
+}
+
+/** @implements REQ_TRANSPORT_026 */
+void UdpTransport::notify_rejection(const MessageRejectionInfo& info) {
+    if (auto* l = listener_.load(std::memory_order_acquire)) {
+        l->on_message_rejected(info);
     }
 }
 

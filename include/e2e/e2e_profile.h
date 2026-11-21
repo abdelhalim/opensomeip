@@ -57,6 +57,11 @@ public:
 
     /**
      * @brief Get the size of the E2E header for this profile
+     *
+     * Message stores up to SOMEIP_MAX_E2E_HEADER_SIZE profile bytes.
+     * A larger size makes E2EProtection::protect/validate return
+     * Result::NOT_IMPLEMENTED. The basic profile returns 12.
+     *
      * @return Header size in bytes
      */
     virtual size_t get_header_size() const = 0;

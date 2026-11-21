@@ -15,6 +15,7 @@
 #define SOMEIP_SD_CLIENT_H
 
 #include "sd_types.h"
+#include "transport/transport.h"
 
 #ifdef SOMEIP_STATIC_ALLOC
 #include "static_config.h"
@@ -44,6 +45,15 @@ public:
     explicit SdClient(const SdConfig& config = SdConfig());
 
     /**
+     * @brief Borrow an exclusive, stopped transport instead of creating UDP.
+     * @param config SD configuration. The supplied transport owns the local bind.
+     * @param transport Must outlive this client, implement multicast membership,
+     *        and be stopped with no listener. The client manages start/stop.
+     * @see transport::ITransport for the injected-transport lifecycle contract.
+     */
+    SdClient(const SdConfig& config, transport::ITransport& transport);
+
+    /**
      * @brief Destructor
      */
     ~SdClient();
@@ -59,6 +69,21 @@ public:
      * @return true on success, false on failure
      */
     bool initialize();
+
+    /**
+     * @brief Result of the last transport start/stop.
+     * @return SUCCESS initially, otherwise the last lifecycle outcome.
+     */
+    Result get_transport_result() const;
+
+    /**
+     * @brief Aggregate local eventgroup multicast membership state
+     *
+     * Reported independently of subscription acceptance: a peer may have
+     * acknowledged a SubscribeEventgroup while the local membership required to
+     * receive those events failed.
+     */
+    [[nodiscard]] MulticastState eventgroup_multicast_state() const;
 
     /**
      * @brief Shutdown the SD client
@@ -157,6 +182,7 @@ public:
 
 private:
 #ifdef SOMEIP_STATIC_ALLOC
+    /** @implements REQ_PLATFORM_STATIC_005 */
     alignas(alignof(std::max_align_t)) char impl_storage_[SOMEIP_PIMPL_SDCLIENT_SIZE];
     SdClientImpl* impl() noexcept { return reinterpret_cast<SdClientImpl*>(impl_storage_); }
     const SdClientImpl* impl() const noexcept { return reinterpret_cast<const SdClientImpl*>(impl_storage_); }

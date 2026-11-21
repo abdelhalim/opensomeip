@@ -66,7 +66,7 @@ Configuration for E2E protection.
 - `uint32_t profile_id` - Profile identifier (0 = basic profile)
 - `std::string profile_name` - Profile name ("basic" by default)
 - `uint16_t data_id` - Data ID for identifying protected data
-- `uint32_t offset` - Offset from Return Code (default: 8 bytes)
+- `uint32_t offset_bits` - Spec Offset of the E2E header, in bits from the start of the Length-covered region (Request ID). Default: `E2EConfig::DEFAULT_OFFSET_BITS` (64), which is wire byte 16. Byte-aligned values above 64 place the header after an unprotected prefix supplied with `Message::set_e2e_unprotected_prefix`. `offset_bits < 64` or a non-multiple of 8 returns `Result::INVALID_ARGUMENT`. A prefix larger than `SOMEIP_MAX_E2E_PREFIX_SIZE` returns `Result::NOT_IMPLEMENTED`.
 - `bool enable_crc` - Enable CRC calculation
 - `bool enable_counter` - Enable counter mechanism
 - `bool enable_freshness` - Enable freshness value
@@ -86,7 +86,7 @@ E2E protection header structure.
 
 ### E2EProfile
 
-Abstract interface for E2E protection profiles. Allows external profiles (e.g., AUTOSAR) to be plugged in.
+Abstract interface for E2E protection profiles. Allows external profiles (e.g., AUTOSAR) to be plugged in. `get_header_size()` may be any size up to `SOMEIP_MAX_E2E_HEADER_SIZE` (default 64). The basic profile returns 12. A larger size returns `Result::NOT_IMPLEMENTED`. `Message::get_e2e_header()` is populated only for a 12-byte header; other sizes are raw bytes via `e2e_header_bytes()`.
 
 ### E2EProfileRegistry
 
@@ -95,6 +95,8 @@ Registry for managing E2E protection profiles.
 **Methods:**
 - `static E2EProfileRegistry& instance()` - Get singleton instance
 - `bool register_profile(E2EProfilePtr profile)` - Register a profile
+- `bool unregister_profile(uint32_t profile_id)` - Unregister a profile by ID; returns `false` if not found
+- `bool is_registered(uint32_t profile_id) const` - Check whether a profile is registered
 - `E2EProfile* get_profile(uint32_t profile_id)` - Get profile by ID
 - `E2EProfile* get_profile(const std::string& profile_name)` - Get profile by name
 - `E2EProfile* get_default_profile()` - Get default (basic) profile
@@ -119,10 +121,29 @@ See the E2E protection examples under `examples/e2e_protection/` for a working i
 
 E2E protection returns `Result` codes:
 - `Result::SUCCESS` - Operation successful
-- `Result::INVALID_ARGUMENT` - Invalid configuration or message
+- `Result::NOT_INITIALIZED` - no profile registered (checked first)
+- `Result::INVALID_ARGUMENT` - Offset overlaps the SOME/IP header, Offset is not a multiple of 8, CRC mismatch, wrong data ID, replay, or other caller errors
+- `Result::NOT_IMPLEMENTED` - prefix or profile header above the compile-time cap
 - `Result::TIMEOUT` - Freshness timeout detected
-- `Result::NOT_INITIALIZED` - Basic profile not initialized
 - Other error codes as appropriate
+
+## Receive policy
+
+`E2EReceiveTable` on `UdpTransportConfig`, `TcpTransportConfig`, and the
+event-driven transport configs names which Service ID and Method/Event ID
+carry the default 12-byte E2E header (Offset 64). Fill the table before
+constructing the transport.
+
+- `E2EReceivePolicy::STACK_MANAGED` validates before the application handler.
+  A `validate()` failure uses `MessageRejectionStage::E2E_INTEGRITY` and does not deliver.
+  A protected frame that fails to deserialize uses `MessageRejectionStage::DESERIALIZE`.
+- `E2EReceivePolicy::APPLICATION_MANAGED` delivers a message whose payload
+  excludes the header. Call `E2EProtection::validate` on that message.
+  Stack-managed checks use the binding's `max_counter_value` and
+  `freshness_timeout_ms` (same defaults as `E2EConfig`).
+
+TP reassembly finishes before this check. A full table returns
+`Result::RESOURCE_EXHAUSTED` from `add`, not a receive rejection.
 
 ## See Also
 

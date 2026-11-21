@@ -24,16 +24,18 @@ The RPC layer provides high-level interfaces for making method calls between SOM
   - Request/response correlation
   - Call cancellation support
   - Statistics tracking
+  - Incoming-message rejection callback (`set_message_rejection_handler`)
 
 #### RpcServer
 - **Purpose**: Server-side interface for handling RPC method calls
 - **Features**:
   - Method handler registration with request/response or fire-and-forget semantics
   - Binds an application RPC endpoint (default `127.0.0.1:30501`, not port 30490)
-  - `E_WRONG_INTERFACE_VERSION` when the request major does not match
+  - `E_WRONG_INTERFACE_VERSION` when a response-expecting request's major does not match
   - Automatic response generation
   - Error handling and return codes
   - Statistics tracking
+  - Incoming-message rejection callback (`set_message_rejection_handler`)
 
 #### RpcTypes
 - **Purpose**: Common types and constants for RPC operations

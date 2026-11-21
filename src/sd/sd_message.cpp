@@ -246,7 +246,7 @@ bool SdOption::deserialize(const platform::ByteBuffer& data, size_t& offset) {
 }
 
 // IPv4EndpointOption implementation
-/** @implements REQ_SD_120, REQ_SD_122, REQ_SD_123 */
+/** @implements REQ_SD_120, REQ_SD_123 */
 platform::ByteBuffer IPv4EndpointOption::serialize() const {
     platform::ByteBuffer data = SdOption::serialize();
 
@@ -634,8 +634,10 @@ uint32_t pick_initial_wait_ms(const SdConfig& config) {
     }
     static thread_local uint32_t lcg_state = 0xA5A5A5A5U;
     lcg_state = lcg_state * 1664525U + 1013904223U;
-    const uint32_t span = max_ms - min_ms + 1U;
-    return min_ms + (lcg_state % span);
+    // Inclusive width is 2^32 when min is 0 and max is UINT32_MAX. A uint32
+    // span wraps to 0 there, and modulo by zero is undefined.
+    const uint64_t span = static_cast<uint64_t>(max_ms) - static_cast<uint64_t>(min_ms) + 1ULL;
+    return min_ms + static_cast<uint32_t>(static_cast<uint64_t>(lcg_state) % span);
 }
 
 std::chrono::milliseconds sd_repetition_interval(const SdConfig& config, uint8_t repetition_index) {
@@ -662,12 +664,14 @@ bool sd_repetition_phase_done(const SdConfig& config, uint8_t next_index) {
     return sd_repetition_interval(config, next_index) >= config.cyclic_offer;
 }
 
-/** @implements REQ_SD_200A, REQ_SD_200B, REQ_SD_200C, REQ_SD_201, REQ_SD_202, REQ_SD_261, REQ_SD_282, REQ_SD_291, REQ_SD_301, REQ_SD_302, REQ_SD_303, REQ_SD_320 */
+/** @implements REQ_SD_200A, REQ_SD_200B, REQ_SD_200C, REQ_SD_201, REQ_SD_202, REQ_SD_261, REQ_SD_282, REQ_SD_291, REQ_SD_301, REQ_SD_302, REQ_SD_303, REQ_SD_320, REQ_SD_331
+ *  @satisfies feat_req_someipsd_1187, feat_req_someipsd_1188 */
 platform::ByteBuffer SdMessage::serialize() const {
     platform::ByteBuffer data;
 
-    // Flags (1 byte) - ensure reserved bits 5-0 are zero (REQ_SD_013)
-    auto const flags_to_send = static_cast<uint8_t>(static_cast<uint32_t>(flags_) & 0xC0U);
+    // Flags: keep Reboot, Unicast, and Explicit Initial Data Control.
+    // Reserved bits 4-0 stay clear (REQ_SD_013).
+    auto const flags_to_send = static_cast<uint8_t>(static_cast<uint32_t>(flags_) & 0xE0U);
     data.push_back(flags_to_send);
 
     // Reserved (3 bytes)
@@ -728,6 +732,9 @@ platform::ByteBuffer SdMessage::serialize() const {
 
 /** @implements REQ_SD_030_E01, REQ_SD_200A, REQ_SD_200B, REQ_SD_200C, REQ_SD_201, REQ_SD_202, REQ_SD_261, REQ_SD_282, REQ_SD_291, REQ_SD_301, REQ_SD_302, REQ_SD_303, REQ_SD_320 */
 bool SdMessage::deserialize(const platform::ByteBuffer& data) {
+    option_wire_index_valid_ = false;
+    ipv4_sd_endpoint_wire_first_ = false;
+    ipv4_sd_endpoint_wire_bits_.reset();
     if (data.size() < 12) {
         return false;
     }
@@ -800,8 +807,11 @@ bool SdMessage::deserialize(const platform::ByteBuffer& data) {
         return false;
     }
 
-    // Parse options
+    // Parse options. Wire index counts every option, including ones that are
+    // skipped, so a later 0x24 is not treated as the first option.
+    option_wire_index_valid_ = true;
     size_t const options_end = offset + options_length;
+    uint16_t wire_index = 0;
     while (offset < options_end) {
         if (offset + 4 > data.size()) {
             return false;
@@ -830,6 +840,21 @@ bool SdMessage::deserialize(const platform::ByteBuffer& data) {
                 return false;
             }
             options_.emplace_back(std::move(option));
+        } else if (option_type == OptionType::IPV4_SD_ENDPOINT) {
+            IPv4SdEndpointOption option;
+            if (!option.deserialize(data, offset)) {
+                return false;
+            }
+            if (options_.size() >= options_.max_size()) {
+                return false;
+            }
+            options_.emplace_back(std::move(option));
+            if (wire_index == 0) {
+                ipv4_sd_endpoint_wire_first_ = true;
+            }
+            if (wire_index <= 0xFFU) {
+                ipv4_sd_endpoint_wire_bits_.set(static_cast<std::size_t>(wire_index));
+            }
         } else if (option_type == OptionType::IPV4_MULTICAST) {
             IPv4MulticastOption option;
             if (!option.deserialize(data, offset)) {
@@ -866,11 +891,81 @@ bool SdMessage::deserialize(const platform::ByteBuffer& data) {
                 return false;
             }
             offset += 3 + option_len;
-            continue;
+        }
+        if (wire_index < 0xFFFFU) {
+            ++wire_index;
         }
     }
 
     return true;
+}
+
+/** @implements REQ_SD_236, REQ_SD_343
+ *  @satisfies feat_req_someipsd_1151, feat_req_someipsd_1152 */
+bool SdMessage::ipv4_sd_endpoint(platform::String<>& address, uint16_t& port) const {
+    // Only a type 0x24 at wire index 0 can replace the datagram source.
+    if (!ipv4_sd_endpoint_wire_first_) {
+        return false;
+    }
+    const IPv4SdEndpointOption* option = nullptr;
+    for (const auto& stored : options_) {
+        if (const auto* sd_endpoint = std::get_if<IPv4SdEndpointOption>(&stored)) {
+            option = sd_endpoint;
+            break;
+        }
+    }
+    if (option == nullptr) {
+        return false;
+    }
+    // SD rides UDP. A non-UDP, empty, multicast, or broadcast endpoint does not
+    // replace the datagram source.
+    if (option->get_protocol() != 0x11U || option->get_port() == 0) {
+        return false;
+    }
+    const uint32_t raw = option->get_ipv4_address();
+    const uint32_t host = someip_ntohl(raw);
+    const auto first_octet = static_cast<uint8_t>((host >> 24U) & 0xFFU);
+    if (raw == 0U || raw == 0xFFFFFFFFU || (first_octet >= 224U && first_octet <= 239U)) {
+        return false;
+    }
+    address = option->get_ipv4_address_string();
+    port = option->get_port();
+    return !address.empty();
+}
+
+/** @implements REQ_SD_343
+ *  @satisfies feat_req_someipsd_1114 */
+bool SdMessage::entry_references_ipv4_sd_endpoint(const SdEntry& entry) const {
+    if (option_wire_index_valid_) {
+        const auto wire_hits = [this](uint8_t index, uint8_t count) {
+            for (uint8_t i = 0; i < count; ++i) {
+                const unsigned pos = static_cast<unsigned>(index) + static_cast<unsigned>(i);
+                if (pos > 0xFFU) {
+                    continue;
+                }
+                if (ipv4_sd_endpoint_wire_bits_.test(pos)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        return wire_hits(entry.get_index1(), entry.get_num_opts1()) ||
+               wire_hits(entry.get_index2(), entry.get_num_opts2());
+    }
+    const auto run_hits = [this](uint8_t index, uint8_t count) {
+        for (uint8_t i = 0; i < count; ++i) {
+            const size_t pos = static_cast<size_t>(index) + static_cast<size_t>(i);
+            if (pos >= options_.size()) {
+                break;
+            }
+            if (std::holds_alternative<IPv4SdEndpointOption>(options_[pos])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return run_hits(entry.get_index1(), entry.get_num_opts1()) ||
+           run_hits(entry.get_index2(), entry.get_num_opts2());
 }
 
 // NOLINTEND(misc-include-cleaner)

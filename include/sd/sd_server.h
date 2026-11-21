@@ -16,6 +16,7 @@
 
 #include "sd_types.h"
 #include "transport/endpoint.h"
+#include "transport/transport.h"
 
 #ifdef SOMEIP_STATIC_ALLOC
 #include "static_config.h"
@@ -45,6 +46,15 @@ public:
     explicit SdServer(const SdConfig& config = SdConfig());
 
     /**
+     * @brief Borrow an exclusive, stopped transport instead of creating UDP.
+     * @param config SD configuration. The supplied transport owns the local bind.
+     * @param transport Must outlive this server, implement multicast membership,
+     *        and be stopped with no listener. The server manages start/stop.
+     * @see transport::ITransport for the injected-transport lifecycle contract.
+     */
+    SdServer(const SdConfig& config, transport::ITransport& transport);
+
+    /**
      * @brief Destructor
      */
     ~SdServer();
@@ -60,6 +70,12 @@ public:
      * @return true on success, false on failure
      */
     bool initialize();
+
+    /**
+     * @brief Result of the last transport start/stop.
+     * @return SUCCESS initially, otherwise the last lifecycle outcome.
+     */
+    Result get_transport_result() const;
 
     /**
      * @brief Shutdown the SD server
@@ -128,6 +144,15 @@ public:
     bool is_ready() const;
 
     /**
+     * @brief Local SD multicast membership state
+     *
+     * Joined after a successful join. Retrying when the join failed and bounded
+     * re-attempts are in progress. Exhausted when they ran out: the server is
+     * running but cannot receive multicast SD.
+     */
+    [[nodiscard]] MulticastState multicast_state() const;
+
+    /**
      * @brief Get server statistics
      *
      * @return Statistics about SD operations
@@ -143,15 +168,21 @@ public:
 
     using SubscriptionAcceptedCallback =
         platform::Function<void(uint16_t service, uint16_t instance, uint16_t eventgroup,
-                                const transport::Endpoint& subscriber)>;
+                                const transport::Endpoint& subscriber,
+                                InitialDataDelivery initial_data)>;
 
     /**
-     * @brief Invoked after a SubscribeEventgroupAck is sent for a new/accepted subscription.
+     * @brief Invoked after a SubscribeEventgroupAck is sent for an accepted subscription.
+     *
+     * `initial_data` is the resolved initial-event decision: legacy peers use
+     * `Default` (send only for a new subscription); a peer that advertises
+     * explicit initial-data control uses `Requested` or `Suppressed`.
      */
     void set_subscription_accepted_callback(SubscriptionAcceptedCallback callback);
 
 private:
 #ifdef SOMEIP_STATIC_ALLOC
+    /** @implements REQ_PLATFORM_STATIC_005 */
     alignas(alignof(std::max_align_t)) char impl_storage_[SOMEIP_PIMPL_SDSERVER_SIZE];
     SdServerImpl* impl() noexcept { return reinterpret_cast<SdServerImpl*>(impl_storage_); }
     const SdServerImpl* impl() const noexcept { return reinterpret_cast<const SdServerImpl*>(impl_storage_); }

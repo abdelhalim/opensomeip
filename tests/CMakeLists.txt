@@ -18,13 +18,44 @@ if(BUILD_TESTS)
     add_executable(test_rpc test_rpc.cpp)
     target_link_libraries(test_rpc someip-rpc gtest_main)
 
+    add_executable(test_transport_injection test_transport_injection.cpp)
+    target_link_libraries(test_transport_injection opensomeip gtest_main)
+    add_test(NAME TransportInjectionTest COMMAND test_transport_injection)
+
+    add_executable(test_sd_injection test_sd_injection.cpp)
+    target_link_libraries(test_sd_injection opensomeip gtest_main)
+    add_test(NAME SdInjectionTest COMMAND test_sd_injection)
+    set_tests_properties(TransportInjectionTest PROPERTIES TIMEOUT 30)
+
+    add_executable(test_subscriber_dispatch test_subscriber_dispatch.cpp)
+    target_link_libraries(test_subscriber_dispatch opensomeip gtest_main)
+    add_test(NAME SubscriberDispatchTest COMMAND test_subscriber_dispatch)
+    set_tests_properties(SubscriberDispatchTest PROPERTIES TIMEOUT 60)
+
+    add_executable(test_rpc_sync_lifetime test_rpc_sync_lifetime.cpp)
+    target_link_libraries(test_rpc_sync_lifetime opensomeip gtest_main)
+    add_test(NAME RpcSyncLifetimeTest COMMAND test_rpc_sync_lifetime)
+    set_tests_properties(RpcSyncLifetimeTest PROPERTIES TIMEOUT 60)
+
+    add_executable(test_facade_teardown test_facade_teardown.cpp)
+    target_link_libraries(test_facade_teardown opensomeip gtest_main)
+    add_test(NAME FacadeTeardownTest COMMAND test_facade_teardown)
+    set_tests_properties(FacadeTeardownTest PROPERTIES TIMEOUT 60)
+
 # SD tests
 add_executable(test_sd test_sd.cpp)
 target_link_libraries(test_sd someip-sd gtest_main)
 
+add_executable(test_sd_offer_find_session test_sd_offer_find_session.cpp)
+target_link_libraries(test_sd_offer_find_session someip-sd gtest_main)
+
 # Events tests
 add_executable(test_events test_events.cpp)
 target_link_libraries(test_events someip-events gtest_main)
+
+# Eventgroup multicast threshold: raw sockets count datagrams.
+add_executable(test_eventgroup_multicast test_eventgroup_multicast.cpp)
+target_link_libraries(test_eventgroup_multicast someip-events gtest_main)
 
 # TCP Transport tests
 add_executable(test_tcp_transport test_tcp_transport.cpp)
@@ -33,6 +64,22 @@ target_link_libraries(test_tcp_transport someip-transport gtest_main)
 # UDP Transport tests
 add_executable(test_udp_transport test_udp_transport.cpp)
 target_link_libraries(test_udp_transport someip-transport gtest_main)
+
+add_executable(test_service_demux test_service_demux.cpp)
+target_link_libraries(test_service_demux opensomeip gtest_main)
+add_test(NAME ServiceDemuxTest COMMAND test_service_demux)
+
+# Multicast membership retry state machine (header-only helper)
+add_executable(test_multicast_membership test_multicast_membership.cpp)
+target_link_libraries(test_multicast_membership someip-sd gtest_main)
+
+# Event-driven UDP transport tests (mock adapter, no real sockets)
+add_executable(test_event_driven_udp_transport test_event_driven_udp_transport.cpp)
+target_link_libraries(test_event_driven_udp_transport someip-transport gtest_main)
+
+# Event-driven TCP transport tests (mock adapter, no real sockets)
+add_executable(test_event_driven_tcp_transport test_event_driven_tcp_transport.cpp)
+target_link_libraries(test_event_driven_tcp_transport someip-transport gtest_main)
 
 # TP tests
 add_executable(test_tp test_tp.cpp)
@@ -49,7 +96,9 @@ target_link_libraries(test_e2e someip-core gtest_main)
     if(WIN32)
         set(_SOCKET_TESTS
             test_platform_threading test_udp_transport test_tcp_transport
-            test_rpc test_sd test_events)
+            test_rpc test_sd test_sd_offer_find_session test_events test_eventgroup_multicast
+            test_transport_injection test_sd_injection test_subscriber_dispatch
+            test_facade_teardown test_rpc_sync_lifetime test_service_demux)
         foreach(_t ${_SOCKET_TESTS})
             target_sources(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/winsock_init.cpp)
         endforeach()
@@ -92,6 +141,35 @@ target_link_libraries(test_e2e someip-core gtest_main)
             ${CMAKE_CURRENT_SOURCE_DIR}/mocks/freertos
             ${CMAKE_SOURCE_DIR}/include/platform/freertos
         )
+
+        add_executable(test_freertos_sleep test_freertos_sleep.cpp)
+        target_include_directories(test_freertos_sleep BEFORE PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/mocks/freertos
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/include/platform/dynamic
+            ${CMAKE_SOURCE_DIR}/include/platform/freertos)
+        target_compile_definitions(test_freertos_sleep PRIVATE configTICK_RATE_HZ=100)
+        target_link_libraries(test_freertos_sleep PRIVATE gtest_main Threads::Threads)
+        add_test(NAME FreeRtosSleepTest COMMAND test_freertos_sleep)
+
+        foreach(tick_bits 16 32)
+            foreach(tick_rate 100 128)
+                set(sleep_target test_freertos_sleep_${tick_bits}_${tick_rate})
+                add_executable(${sleep_target} test_freertos_sleep_chunks.cpp)
+                target_include_directories(${sleep_target} BEFORE PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/mocks/freertos
+                    ${CMAKE_SOURCE_DIR}/include
+                    ${CMAKE_SOURCE_DIR}/include/platform/dynamic
+                    ${CMAKE_SOURCE_DIR}/include/platform/freertos)
+                target_compile_definitions(${sleep_target} PRIVATE
+                    configTICK_RATE_HZ=${tick_rate}
+                    configUSE_16_BIT_TICKS=$<STREQUAL:${tick_bits},16>
+                    SOMEIP_FREERTOS_CAPTURE_DELAYS)
+                target_link_libraries(${sleep_target} PRIVATE gtest_main Threads::Threads)
+                add_test(NAME FreeRtosSleepChunks${tick_bits}_${tick_rate} COMMAND ${sleep_target})
+                set_tests_properties(FreeRtosSleepChunks${tick_bits}_${tick_rate} PROPERTIES TIMEOUT 10)
+            endforeach()
+        endforeach()
 
         # ThreadX PAL via mock
         add_pal_mock_test(test_pal_threadx_mock
@@ -211,6 +289,16 @@ target_link_libraries(test_e2e someip-core gtest_main)
         add_test(NAME CapiRpcRoundtripTest COMMAND test_capi_rpc_roundtrip)
         set_tests_properties(CapiRpcRoundtripTest PROPERTIES TIMEOUT 30 LABELS "capi;integration")
 
+        # Compiled as C. The library is C++, so the link step uses the C++ driver.
+        add_executable(test_capi_pure_c capi/unit/test_capi_pure_c.c)
+        target_link_libraries(test_capi_pure_c PRIVATE opensomeip_capi)
+        set_target_properties(test_capi_pure_c PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED ON
+            LINKER_LANGUAGE CXX)
+        add_test(NAME CapiPureCConsumer COMMAND test_capi_pure_c)
+        set_tests_properties(CapiPureCConsumer PROPERTIES TIMEOUT 30 LABELS "capi;unit")
+
         set(_CAPI_TESTS
             CapiMessageTest CapiSerializerTest CapiTransportTest
             CapiRpcTest CapiSdTest CapiEventsTest CapiTpTest CapiE2ETest)
@@ -225,7 +313,7 @@ target_link_libraries(test_e2e someip-core gtest_main)
             target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         endforeach()
         if(WIN32)
-            foreach(_t test_capi_udp_hello test_capi_rpc_roundtrip)
+            foreach(_t test_capi_udp_hello test_capi_rpc_roundtrip test_capi_events)
                 target_sources(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/winsock_init.cpp)
             endforeach()
         endif()
@@ -239,17 +327,24 @@ target_link_libraries(test_e2e someip-core gtest_main)
     add_test(NAME EndpointTest COMMAND test_endpoint)
     add_test(NAME RpcTest COMMAND test_rpc)
     add_test(NAME SdTest COMMAND test_sd)
+    add_test(NAME SdOfferFindSessionTest COMMAND test_sd_offer_find_session)
     add_test(NAME EventsTest COMMAND test_events)
+    add_test(NAME EventgroupMulticastTest COMMAND test_eventgroup_multicast)
     add_test(NAME TcpTransportTest COMMAND test_tcp_transport)
     add_test(NAME UdpTransportTest COMMAND test_udp_transport)
+    add_test(NAME MulticastMembershipTest COMMAND test_multicast_membership)
+    add_test(NAME EventDrivenUdpTransportTest COMMAND test_event_driven_udp_transport)
+    add_test(NAME EventDrivenTcpTransportTest COMMAND test_event_driven_tcp_transport)
     add_test(NAME TpTest COMMAND test_tp)
     add_test(NAME E2ETest COMMAND test_e2e)
 
     # Per-test timeout (seconds) to catch hangs in local and CI runs
     set(_ALL_TESTS
         PlatformThreadingTest SerializationTest MessageTest
-        SessionManagerTest EndpointTest RpcTest SdTest EventsTest
-        TcpTransportTest UdpTransportTest TpTest E2ETest
+        SessionManagerTest EndpointTest RpcTest SdTest SdOfferFindSessionTest EventsTest
+        EventgroupMulticastTest
+        TcpTransportTest UdpTransportTest ServiceDemuxTest MulticastMembershipTest
+        EventDrivenUdpTransportTest EventDrivenTcpTransportTest TpTest E2ETest
     )
     if(NOT WIN32)
         list(APPEND _ALL_TESTS
@@ -257,4 +352,13 @@ target_link_libraries(test_e2e someip-core gtest_main)
         )
     endif()
     set_tests_properties(${_ALL_TESTS} PROPERTIES TIMEOUT 30)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+        add_test(
+            NAME ApiDocSources
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/python/test_published_api_pages.py
+        )
+        set_tests_properties(ApiDocSources PROPERTIES TIMEOUT 30 LABELS "docs")
+    endif()
 endif()

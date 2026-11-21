@@ -1598,14 +1598,16 @@ SD Option Handling
    :status: implemented
    :priority: medium
    :category: happy_path
-   :verification: Unit test: Serialize IPv4EndpointOption (type=0x04) with address/port, verify 12-byte output with correct type code.
+   :verification: Unit test: Serialize IPv4SdEndpointOption (type=0x24) with address 192.0.2.10 port 40000 protocol UDP, verify Length 0x0009 and type 0x24, then deserialize. Covered by IPv4SdEndpointOptionRoundTrip.
 
    The software shall support the IPv4 SD Endpoint Option (Type 0x24)
-   for specifying the SD communication endpoint.
+   for specifying the SD communication endpoint (IPv4 address, L4 protocol,
+   and port). This is distinct from the IPv4 Endpoint Option (Type 0x04)
+   used for application and event traffic.
 
-   **Rationale**: IPv4 endpoint options carry the transport address for service communication.
+   **Rationale**: The SD endpoint tells peers where to send SD replies and which channel to use for reboot detection.
 
-   **Code Location**: ``src/sd/sd_message.cpp`` (IPv4EndpointOption::serialize/deserialize)
+   **Code Location**: ``include/sd/sd_message.h`` (IPv4SdEndpointOption)
 
 .. requirement:: IPv6 SD Endpoint Option
    :id: REQ_SD_123
@@ -2223,18 +2225,20 @@ SD Option Format Details
 .. requirement:: SD IPv4 SD Endpoint Option Format
    :id: REQ_SD_236
    :satisfies: feat_req_someipsd_1080, feat_req_someipsd_1082, feat_req_someipsd_1083, feat_req_someipsd_1085, feat_req_someipsd_1087
-   :status: pending
+   :status: implemented
    :priority: medium
    :category: happy_path
-   :verification: Pending: Type 0x24 is declared in ``OptionType`` but has no codec class; ``SdMessage::deserialize`` still skips it as unknown.
+   :verification: Unit test: Round-trip type 0x24 Length 0x0009; reject Length other than 0x0009 and a truncated option. Covered by IPv4SdEndpointOptionRoundTrip, IPv4SdEndpointOptionRejectsMalformedLength, and IPv4SdEndpointOptionRejectsTruncation.
 
-   The software shall parse IPv4 SD Endpoint Options (Type 0x24)
-   containing the SD communication endpoint. This option is not
-   referenced by entries.
+   The software shall parse IPv4 SD Endpoint Options (Type 0x24, Length
+   0x0009) containing the unicast IPv4 address, L4 protocol, and port of
+   the sender's SD implementation. A malformed length or a truncated
+   option shall reject the SD message. IPv6 SD Endpoint Option Type
+   0x26 is out of scope.
 
    **Rationale**: SD endpoint option carries the SD communication endpoint independently of entries.
 
-   **Code Location**: not implemented (see REQ_SD_1084 for reply addressing using the datagram source until Type 0x24 is parsed)
+   **Code Location**: ``src/sd/sd_message.cpp`` (IPv4 SD Endpoint parse), ``include/sd/sd_message.h`` (IPv4SdEndpointOption)
 
 
 SD Option Referencing Details
@@ -2711,21 +2715,33 @@ SD Shutdown and Recovery
    :status: implemented
    :priority: high
    :category: happy_path
-   :verification: Integration test: when the IPv4EndpointOption port differs from the SD datagram source port, SubscribeEventgroupAck is received on the source socket. Covered by SubscribeAckGoesToSdSenderNotEventEndpoint.
+   :verification: Integration test: with no IPv4 SD Endpoint Option, SubscribeEventgroupAck is received on the datagram source socket and not on the event endpoint. When a usable Type 0x24 option names a different endpoint, Find responses, SubscribeEventgroup, and SubscribeEventgroupAck/Nack use that endpoint, and reboot detection follows it. A multicast 0x24 does not replace the source. Two offers in one datagram update the reboot channel once. Multicast and unicast reception keep separate session observations, and a reboot releases the endpoint index after replay. Covered by SubscribeAckGoesToSdSenderNotEventEndpoint, FindOfferUsesIpv4SdEndpoint, SubscribeAckUsesIpv4SdEndpointNotEventEndpoint, RebootAndSubscribeFollowIpv4SdEndpoint, IPv4SdEndpointRejectsMulticastAddress, BundledOffersDoNotFalseReboot, MulticastAndUnicastSessionsStayIndependent, and RebootReleasesEndpointIndexAfterReplay.
 
    SubscribeEventgroupAck and SubscribeEventgroupNack shall be sent to the
    source IP address and source port of the received SD datagram, not to
    the IPv4 Endpoint Option used for event delivery.
 
-   If an IPv4 SD Endpoint Option (Type 0x24) is present, the specification
-   requires that option to override the datagram source. Type 0x24 is not
-   yet parsed (REQ_SD_236 pending), so this implementation uses the
-   datagram source until that codec exists.
+   If a usable IPv4 SD Endpoint Option (Type 0x24) is the first option, that
+   endpoint replaces the datagram source for SD replies (OfferService after
+   FindService, SubscribeEventgroup after OfferService, and
+   SubscribeEventgroupAck/Nack after SubscribeEventgroup) and for reboot
+   detection. The application/event endpoint is unchanged. When the option
+   is absent, not first, or not a usable UDP unicast endpoint, the datagram
+   source is used.
+
+   Reboot detection on that endpoint keeps a separate session observation
+   for datagrams received by multicast and for datagrams received by
+   unicast. A session transition on one stream is not a reboot of the
+   other. When the stack cannot report the datagram destination, both
+   streams share the unicast observation. After subscriptions are replayed,
+   the cached endpoint index for each cleared service is released so a
+   later offer can be addressed.
 
    **Rationale**: The endpoint option address is for event delivery; SD
-   replies must reach the SD protocol peer.
+   replies must reach the SD protocol peer, which may advertise a different
+   SD socket than the datagram source.
 
-   **Code Location**: ``src/sd/sd_server.cpp`` (send_subscribe_response)
+   **Code Location**: ``src/sd/sd_server.cpp`` (process_sd_entries, send_subscribe_response), ``src/sd/sd_client.cpp`` (handle_service_offer)
 
 .. requirement:: SD Reboot Recovery
    :id: REQ_SD_311
@@ -2797,18 +2813,30 @@ SD Initial Event Handling
 
 .. requirement:: SD Initial Event Requesting
    :id: REQ_SD_331
-   :satisfies: feat_req_someipsd_1191, feat_req_someipsd_1192, feat_req_someipsd_1193, feat_req_someipsd_946
+   :satisfies: feat_req_someipsd_322, feat_req_someipsd_1187, feat_req_someipsd_1188, feat_req_someipsd_1191, feat_req_someipsd_1192, feat_req_someipsd_1193, feat_req_someipsd_1194, feat_req_someipsd_946
    :status: implemented
    :priority: medium
    :category: happy_path
-   :verification: Unit test: Server ACKs subscription with initial event flag, verify initial field values are sent via unicast to subscriber.
+   :verification: Unit and integration tests. Header serialization keeps bit 0x20 and clears reserved flag bits. A client sets Initial Data Requested on the first Subscribe and after reboot, and clears it on renewal while the previous TTL is still valid. A repeated Subscribe while an Ack is still outstanding sends StopSubscribe and Subscribe together when the server did not advertise the capability, and only the I flag when it did. A server that sees the capability flag honors the entry bit (send or suppress field notifications after Ack); a legacy peer keeps the implicit new-subscription initial field. Covered by ExplicitInitialDataFlagRoundTrip, ClientRequestsInitialDataOnFirstSubscribeNotRenewal, CapableServerMissedAckDoesNotStopSubscribe, and ExplicitInitialDataControlsFieldDelivery.
 
-   The software shall request initial events after reboot or when
-   no active subscription exists for the eventgroup.
+   The client and server shall implement explicit requesting of Initial
+   Events. Outgoing SD messages advertise the Explicit Initial Data
+   Control Flag. The client sets the Initial Data Requested flag on the
+   first SubscribeEventgroup for an eventgroup, after reboot recovery,
+   and while no subscription is active, and clears it on a further
+   Subscribe whose previous TTL is still valid. When an Ack has not
+   arrived and the server's SD messages do not advertise the capability,
+   the client sends StopSubscribeEventgroup and SubscribeEventgroup in
+   the same datagram so a legacy server treats the retry as a new
+   subscription. The server honors the entry flag only when the sending
+   peer advertises the capability; otherwise it keeps the legacy rule of
+   sending initial field values only for a new subscription. The resolved
+   decision is delivered to the subscription-accepted callback and from
+   there into event publication.
 
-   **Rationale**: Version-aware workflows ensure client-server compatibility.
+   **Rationale**: Explicit initial-data control refreshes field values after loss or reboot without repeating them on ordinary renewal.
 
-   **Code Location**: ``src/sd/sd_client.cpp`` (subscribe_eventgroup entry construction)
+   **Code Location**: ``src/sd/sd_message.cpp`` (flag mask), ``src/sd/sd_client.cpp`` (subscribe_eventgroup), ``src/sd/sd_server.cpp`` (send_subscribe_response), ``src/events/event_publisher.cpp``
 
 
 SD Advanced Features
@@ -2862,18 +2890,23 @@ SD Advanced Features
 
 .. requirement:: SD IPv4 SD Endpoint Processing
    :id: REQ_SD_343
-   :satisfies: feat_req_someipsd_1151, feat_req_someipsd_1152, feat_req_someipsd_1153, feat_req_someipsd_1154, feat_req_someipsd_1155, feat_req_someipsd_1156
+   :satisfies: feat_req_someipsd_1114, feat_req_someipsd_1151, feat_req_someipsd_1152, feat_req_someipsd_1153, feat_req_someipsd_1154, feat_req_someipsd_1155, feat_req_someipsd_1156
    :status: implemented
    :priority: medium
    :category: happy_path
-   :verification: Unit test: Parse IPv4 SD EndpointOption (type=0x24), verify SD endpoint fields are extracted and not referenced by entries.
+   :verification: Unit test: only the first option on the wire is the SD endpoint; a later 0x24 is ignored, including when an unsupported option ahead of it was skipped; a multicast address is not usable; a second 0x24 is not used; an entry run that includes 0x24 is detected at its wire index. Integration: Subscribe that references 0x24 is NACKed to the SD endpoint, and the application endpoint port is kept. Covered by IPv4SdEndpointPlacementAndEntryReference, IPv4SdEndpointAfterSkippedOptionIsNotFirst, IPv4SdEndpointRejectsMulticastAddress, and SubscribeAckUsesIpv4SdEndpointNotEventEndpoint.
 
-   The software shall process IPv4 SD Endpoint Options when present,
-   using them instead of the source IP/port for SD communication.
+   The software shall process at most the first IPv4 SD Endpoint Option,
+   and only when it is the first option in the options array on the wire.
+   An unsupported option that is skipped does not move a later 0x24 into
+   first place. A multicast address is not a usable SD endpoint. Further
+   IPv4 SD Endpoint Options shall be ignored. Entries shall not reference
+   this option; a SubscribeEventgroup entry that does is rejected. The
+   option is not transmitted by default.
 
-   **Rationale**: TTL configuration controls service and subscription expiry timing.
+   **Rationale**: The SD endpoint is message-scoped, appears at most once at the front of the options array, and is separate from entry endpoint runs.
 
-   **Code Location**: ``src/sd/sd_server.cpp`` (subscription TTL handling)
+   **Code Location**: ``src/sd/sd_message.cpp`` (ipv4_sd_endpoint, entry_references_ipv4_sd_endpoint), ``src/sd/sd_server.cpp``, ``src/sd/sd_client.cpp``
 
 .. requirement:: SD Mandatory Feature Set
    :id: REQ_SD_344
@@ -3060,11 +3093,11 @@ SD Advanced Features
 
 .. requirement:: SD Service Registration
    :id: REQ_SD_356
-   :satisfies: feat_req_someipsd_1194, feat_req_someipsd_1195, feat_req_someipsd_1262, feat_req_someipsd_1297
+   :satisfies: feat_req_someipsd_1195, feat_req_someipsd_1262, feat_req_someipsd_1297
    :status: implemented
    :priority: medium
    :category: happy_path
-   :verification: Unit test: Configure SD timing parameters, verify initial_delay, repetition_base, and cyclic_offer_delay are applied.
+   :verification: Unit test: Configure SD timing parameters, verify initial_delay, repetition_base, and cyclic_offer_delay are applied. Explicit initial events are REQ_SD_331, not this requirement.
 
    The software shall support service registration and deregistration
    with proper cleanup of associated subscriptions and endpoints.

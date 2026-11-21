@@ -13,29 +13,29 @@
 
 #include "rpc/rpc_server.h"
 
-// NOLINTNEXTLINE(misc-include-cleaner) - placement new used under SOMEIP_STATIC_ALLOC
-#include <new>
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <new>  // NOLINT(misc-include-cleaner) - static allocation placement new
+#include <unordered_map>
+#include <utility>
 
+#include "../common/callback_storage.h"
+#include "../transport/transport_session.h"
 #include "common/result.h"
-// NOLINTNEXTLINE(misc-include-cleaner) - platform::UnorderedMap via containers dispatch header
-#include "platform/containers.h"
+#include "platform/containers.h"  // NOLINT(misc-include-cleaner) - PAL dispatch
 #include "platform/thread.h"
 #include "rpc/rpc_types.h"
 #include "someip/message.h"
 #include "someip/types.h"
 #include "transport/endpoint.h"
+#include "transport/service_demux.h"
 #include "transport/transport.h"
-#include "transport/udp_transport.h"
-
-#include <atomic>
-#include <cstdint>
-#include <memory>
-#include <unordered_map>
-#include <utility>
 
 namespace someip::rpc {
 
-// NOLINTBEGIN(misc-include-cleaner) - platform::Mutex from platform/thread.h (IWYU false positives in impl).
+// NOLINTBEGIN(misc-include-cleaner) - platform::Mutex from platform/thread.h (IWYU false positives
+// in impl).
 
 /**
  * @brief RPC Server implementation
@@ -47,20 +47,57 @@ namespace someip::rpc {
  * @satisfies feat_req_someip_92
  */
 class RpcServerImpl : public transport::ITransportListener {
+    class ShutdownGate {
+       public:
+        explicit ShutdownGate(RpcServerImpl& owner) : owner_(owner)
+        {
+            platform::ScopedLock const lock(owner_.methods_mutex_);
+            owner_.shutting_down_ = true;
+        }
+        ~ShutdownGate()
+        {
+            platform::ScopedLock const lock(owner_.methods_mutex_);
+            owner_.shutting_down_ = false;
+        }
+        ShutdownGate(const ShutdownGate&) = delete;
+        ShutdownGate& operator=(const ShutdownGate&) = delete;
+        ShutdownGate(ShutdownGate&&) = delete;
+        ShutdownGate& operator=(ShutdownGate&&) = delete;
+
+       private:
+        RpcServerImpl& owner_;
+    };
+
 public:
-    RpcServerImpl(uint16_t service_id, uint8_t interface_version,
-                  const transport::Endpoint& bind_endpoint)
+    template <typename Transport>
+    RpcServerImpl(uint16_t service_id, uint8_t interface_version, Transport&& transport)
         : service_id_(service_id),
           interface_version_(interface_version),
-          transport_(bind_endpoint),
-          running_(false) {
+          transport_session_(std::forward<Transport>(transport)),
+          transport_(transport_session_.get()),
+          running_(false)
+    {
+    }
 
-        transport_.set_listener(this);
+    RpcServerImpl(uint16_t service_id, uint8_t interface_version, transport::ServiceDemux& demux)
+        : service_id_(service_id),
+          interface_version_(interface_version),
+          transport_session_(demux.transport()),
+          transport_(transport_session_.get()),
+          demux_(&demux),
+          running_(false)
+    {
     }
 
     ~RpcServerImpl() override
     {
+#ifdef __cpp_exceptions
+        try {
+            shutdown();
+        } catch (...) {}  // NOLINT(bugprone-empty-catch) destructor must not throw
+#else
         shutdown();
+#endif
     }
 
     RpcServerImpl(const RpcServerImpl&) = delete;
@@ -68,12 +105,31 @@ public:
     RpcServerImpl(RpcServerImpl&&) = delete;
     RpcServerImpl& operator=(RpcServerImpl&&) = delete;
 
+    Result get_transport_result() const
+    {
+        if (demux_ != nullptr) {
+            return registration_result_.load(std::memory_order_acquire);
+        }
+        return transport_session_.result();
+    }
+
     bool initialize() {
+        platform::ScopedLock const lifecycle_lock(lifecycle_mutex_);
         if (running_) {
             return true;
         }
 
-        if (transport_.start() != Result::SUCCESS) {
+        if (demux_ != nullptr) {
+            const Result registered = demux_->register_service(service_id_, *this);
+            registration_result_.store(registered, std::memory_order_release);
+            if (registered != Result::SUCCESS) {
+                return false;
+            }
+            running_ = true;
+            return true;
+        }
+
+        if (transport_session_.start(*this) != Result::SUCCESS) {
             return false;
         }
 
@@ -82,21 +138,34 @@ public:
     }
 
     void shutdown() {
+        platform::ScopedLock const lifecycle_lock(lifecycle_mutex_);
+        ShutdownGate const gate(*this);
+        if (demux_ != nullptr) {
+            if (running_) {
+                running_ = false;
+                static_cast<void>(demux_->unregister_service(service_id_));
+            }
+            someip::detail::release_entries(method_handlers_, methods_mutex_);
+            return;
+        }
+
         if (!running_) {
+            transport_session_.stop();
             return;
         }
 
         running_ = false;
+        transport_session_.stop();
 
-        // Clear all method handlers
-        platform::ScopedLock const lock(methods_mutex_);
-        method_handlers_.clear();
-
-        transport_.stop();
+        someip::detail::release_entries(method_handlers_, methods_mutex_);
     }
 
     bool register_method(MethodId method_id, MethodHandler handler, MethodSemantics semantics) {
         platform::ScopedLock const lock(methods_mutex_);
+        // Registration before initialize() is supported; registration during teardown is not.
+        if (shutting_down_) {
+            return false;
+        }
 
         // Check if already registered
         const bool already_exists = method_handlers_.count(method_id) > 0;
@@ -140,6 +209,12 @@ public:
     RpcServer::Statistics get_statistics() const {
         // TODO: Implement statistics tracking
         return RpcServer::Statistics{};
+    }
+
+    void set_message_rejection_handler(
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler) {
+        platform::ScopedLock const lock(rejection_mutex_);
+        rejection_handler_ = std::move(handler);
     }
 
 private:
@@ -234,6 +309,18 @@ private:
         // TODO: Handle transport errors
     }
 
+    /** @implements REQ_TRANSPORT_026 */
+    void on_message_rejected(const transport::MessageRejectionInfo& info) override {
+        platform::Function<void(const transport::MessageRejectionInfo&)> handler;
+        {
+            platform::ScopedLock const lock(rejection_mutex_);
+            handler = rejection_handler_;
+        }
+        if (handler) {
+            handler(info);
+        }
+    }
+
     void stamp_interface_version(Message& msg) const {
         msg.set_interface_version(interface_version_);
     }
@@ -285,12 +372,20 @@ private:
 
     uint16_t service_id_;
     uint8_t interface_version_;
-    transport::UdpTransport transport_;
+    transport::detail::TransportSession transport_session_;
+    transport::ITransport& transport_;
+    transport::ServiceDemux* demux_{nullptr};
+    std::atomic<Result> registration_result_{Result::SUCCESS};
 
     platform::UnorderedMap<MethodId, RegisteredMethod, 32> method_handlers_;
     mutable platform::Mutex methods_mutex_;
+    platform::Mutex lifecycle_mutex_;
+    bool shutting_down_{false};
 
     std::atomic<bool> running_;
+
+    platform::Function<void(const transport::MessageRejectionInfo&)> rejection_handler_;
+    mutable platform::Mutex rejection_mutex_;
 };
 
 #ifdef SOMEIP_STATIC_ALLOC
@@ -310,6 +405,30 @@ RpcServer::RpcServer(uint16_t service_id, uint8_t interface_version,
 }
 #endif
 
+RpcServer::RpcServer(uint16_t service_id, transport::ITransport& transport,
+                     uint8_t interface_version)
+#ifdef SOMEIP_STATIC_ALLOC
+{
+    new (impl_storage_) RpcServerImpl(service_id, interface_version, transport);
+}
+#else
+    : impl_(std::make_unique<RpcServerImpl>(service_id, interface_version, transport))
+{
+}
+#endif
+
+RpcServer::RpcServer(uint16_t service_id, transport::ServiceDemux& demux,
+                     uint8_t interface_version)
+#ifdef SOMEIP_STATIC_ALLOC
+{
+    new (impl_storage_) RpcServerImpl(service_id, interface_version, demux);
+}
+#else
+    : impl_(std::make_unique<RpcServerImpl>(service_id, interface_version, demux))
+{
+}
+#endif
+
 RpcServer::~RpcServer() {
 #ifdef SOMEIP_STATIC_ALLOC
     impl()->~RpcServerImpl();
@@ -322,6 +441,11 @@ bool RpcServer::initialize() {
 
 void RpcServer::shutdown() {
     impl()->shutdown();
+}
+
+Result RpcServer::get_transport_result() const
+{
+    return impl()->get_transport_result();
 }
 
 bool RpcServer::register_method(MethodId method_id, MethodHandler handler, MethodSemantics semantics) {
@@ -346,6 +470,11 @@ transport::Endpoint RpcServer::get_local_endpoint() const {
 
 bool RpcServer::is_ready() const {
     return impl()->is_ready();
+}
+
+void RpcServer::set_message_rejection_handler(
+    platform::Function<void(const transport::MessageRejectionInfo&)> handler) {
+    impl()->set_message_rejection_handler(std::move(handler));
 }
 
 RpcServer::Statistics RpcServer::get_statistics() const {

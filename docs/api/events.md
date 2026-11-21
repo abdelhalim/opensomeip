@@ -19,15 +19,17 @@ The Events layer implements SOME/IP event notifications and field publications, 
   - Field value publishing (on-demand or on-change)
   - Subscription management for event groups
   - Cyclic and triggered publication modes
+  - Incoming-message rejection callback (`set_message_rejection_handler`)
 
 #### EventSubscriber
 - **Purpose**: Client-side event reception and field requests
 - **Features**:
-  - Event group subscription with filters
+  - Event group subscription (one instance/eventgroup per service per subscriber)
   - Event notification callbacks
   - Field value requests (polling)
   - Subscription status tracking
   - Automatic reconnection handling
+  - Incoming-message rejection callback (`set_message_rejection_handler`)
 
 #### EventTypes
 - **Purpose**: Event system types and configurations
@@ -66,6 +68,10 @@ speed_config.event_id = 0x8002;
 speed_config.eventgroup_id = 0x0001;
 speed_config.notification_type = NotificationType::ON_CHANGE;
 speed_config.is_field = true;
+speed_config.has_getter = true;
+speed_config.getter_method_id = 0x0010;
+speed_config.has_setter = true;
+speed_config.setter_method_id = 0x0011;
 
 publisher.register_event(speed_config);
 
@@ -88,6 +94,9 @@ using namespace someip::events;
 EventSubscriber subscriber(0xABCD);  // Client ID
 subscriber.initialize();
 
+// Remote destination must be explicit. An unresolved endpoint fails before send.
+subscriber.set_default_endpoint("192.168.1.10", 40000);
+
 // Subscribe to event group
 subscriber.subscribe_eventgroup(0x1001, 0x0001, 0x0001,
     [](const EventNotification& notification) {
@@ -99,10 +108,20 @@ subscriber.subscribe_eventgroup(0x1001, 0x0001, 0x0001,
         std::cout << "Subscription state: " << (int)state << std::endl;
     });
 
-// Request field value
-subscriber.request_field(0x1001, 0x0001, 0x8002,
+// Getter: empty REQUEST to the configured method id. Response type is 0x80.
+subscriber.request_field(0x1001, 0x0001, 0x0010,
     [](const EventNotification& field_value) {
-        // Handle field response
+        // field_value.event_data is the current field value
+    });
+
+// Setter: REQUEST payload is the desired value. The response payload is the
+// value the server stored.
+platform::ByteBuffer new_speed;
+new_speed.push_back(0x00);
+new_speed.push_back(0x3C);
+subscriber.set_field(0x1001, 0x0001, 0x0011, new_speed,
+    [](const EventNotification& stored) {
+        // stored.event_data is the value actually stored
     });
 ```
 
@@ -142,6 +161,23 @@ subscriber.subscribe_eventgroup(service_id, instance_id, 0x0001,
                                notification_callback);
 ```
 
+Each subscriber accepts only one `(instance_id, eventgroup_id)` for a given
+`service_id`. A different group or instance for that service is rejected without
+sending or replacing the original callback. Exact-key renewal and subscriptions
+to different services remain supported; unsubscribe releases the service slot.
+This restriction also applies through the C API. Notifications contain service
+and event IDs but no instance/eventgroup identity, and the current subscriber API
+has no receive-endpoint binding that could disambiguate them.
+
+`EventgroupConfig::multicast_threshold`, stored with
+`EventPublisher::configure_eventgroup`, chooses how an eventgroup is sent.
+Threshold 0, the default for an unconfigured group, unicasts each subscriber.
+Threshold 1 sends one multicast datagram and no unicast copy. A threshold
+above 1 unicasts while the active subscriber count is below it and sends one
+multicast datagram at and above it. The multicast address and port come from
+the same config. A non-zero threshold without an IPv4 multicast address, or
+with port 0, is rejected. Initial field events stay unicast.
+
 ## Fields vs Events
 
 ### Fields
@@ -158,12 +194,14 @@ subscriber.subscribe_eventgroup(service_id, instance_id, 0x0001,
 
 ## Filters and Selectors
 
-Event filters allow selective notifications:
+Filter metadata is stored but is not evaluated during event delivery. Filters
+are not an event-to-group membership map and cannot disambiguate subscriptions.
+Selective sending/filter enforcement remains unimplemented (`REQ_MSG_122`).
 
 ```cpp
 std::vector<EventFilter> filters = {
-    {0x8001, {0x01}},  // Only temperature > threshold
-    {0x8002, {0x00}}   // Only speed changes
+    {0x8001, {0x01}},  // Metadata only; no threshold is applied
+    {0x8002, {0x00}}
 };
 
 subscriber.subscribe_eventgroup(service_id, instance_id, eventgroup_id,
@@ -196,7 +234,7 @@ Client Request → PENDING → SUBSCRIBED → Active Notifications
 
 ### Subscriber Optimizations
 - **Callback Efficiency**: Fast notification processing
-- **Filter Application**: Server-side filtering when possible
+- **Filter Metadata**: Stored for future filtering support; not currently enforced
 - **Connection Management**: Automatic reconnection
 - **Resource Limits**: Configurable subscription limits
 

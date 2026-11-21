@@ -430,6 +430,27 @@ ScopedLock Interface
 
    **Code Location**: ``include/platform/thread.h``
 
+Thread Identity
+---------------
+
+.. requirement:: PAL Current Thread Identity
+   :id: REQ_PAL_THREAD_ID
+   :satisfies: REQ_ARCH_002
+   :status: implemented
+   :priority: high
+   :category: happy_path
+   :verification: Unit test: Repeated get_id calls in one thread compare equal; a simultaneously live worker has a different identity.
+
+   ``someip::platform::this_thread::get_id()`` shall return an equality-comparable
+   ``ThreadId`` identifying the calling thread or task. The identity shall remain
+   stable during that thread's lifetime and differ from another simultaneously
+   live thread. Identity reuse after termination is permitted.
+
+   **Rationale**: Callback reentrancy checks require native task identity on RTOS
+   targets where language-level thread-local storage is not task-local.
+
+   **Code Location**: ``include/platform/*/thread_impl.h``
+
 sleep_for Interface
 -------------------
 
@@ -846,6 +867,32 @@ Container Interface
 
    **Code Location**: ``include/platform/static/containers_impl.h``,
    ``src/CMakeLists.txt`` (ETL build flags)
+
+.. requirement:: ETL Error Handler
+   :id: REQ_PAL_ETL_ERROR_HANDLER
+   :satisfies: REQ_ARCH_008
+   :status: implemented
+   :priority: high
+   :category: error_path
+   :verification: Unit test: ``test_etl_error_handler.cpp`` — TC_ETL_HANDLER_REGISTERED, TC_ETL_HANDLER_VECTOR_OVERFLOW, TC_ETL_HANDLER_NO_ABORT. After reset the error count is zero. Pushing a ``Vector`` past its capacity increments the count and leaves ``size()`` unchanged. Ten further overflows increment the count and do not abort.
+
+   When static allocation is enabled, ``init_static_allocator()`` shall
+   register an ETL error callback before the message pool is initialized.
+   The callback shall count the error and return, so an ETL assertion does
+   not abort the process.
+
+   **Rationale**: With exceptions disabled, a bounded ``Vector`` reports
+   capacity failure through ETL. Returning from the callback leaves the
+   process running and increments the error count, so the caller can
+   detect the failure. This does not apply to ``UnorderedMap``: its ETL
+   overflow segfaults, so callers must check ``full()`` before ``insert``.
+
+   **Error Handling**: Increment the error count and return. The container
+   size stays at its compile-time capacity.
+
+   **Code Location**: ``include/platform/static/etl_error_handler.h``,
+   ``src/platform/static/etl_error_handler.cpp``,
+   ``src/platform/static/memory.cpp`` (``init_static_allocator``)
 
 Buffer Pool Interface
 ---------------------
